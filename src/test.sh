@@ -16,6 +16,15 @@
 #python main.py --data_test Set5+Set14 --scale 2 --pre_train ../experiment/edsr_dwconv_x2_ft/model/model_best.pt --test_only --self_ensemble --save edsr_dwconv_x2_ft_bench --save_results --n_threads 0
 
 # test esdr
-python main.py --data_test Set5+Set14 --scale 2 --pre_train ../models/edsr_baseline_x2-1bc95232.pt --test_only --self_ensemble --save edsr_x2_bench --save_results --n_threads 0
+#python main.py --data_test Set5+Set14 --scale 2 --pre_train ../models/edsr_baseline_x2-1bc95232.pt --test_only --self_ensemble --save edsr_x2_bench --save_results --n_threads 0
 
 
+# train edsr attention
+#python main.py --model EDSR_ATTENTION --scale 2 --epochs 50 --save edsr_attention_x2
+
+
+# train edsr attention fine-tune
+#python main.py --model EDSR_ATTENTION --scale 2 --patch_size 96 --save edsr_attention_x2_ft --reset --epochs 20 --pre_train ../models/edsr_baseline_x2-1bc95232.pt --data_range 1-100/101-105 --n_threads 0
+
+# train dwconv + attention
+python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save edsr_dwconv_attention_x2_ft --reset --epochs 20 --pre_train ../models/edsr_baseline_x2-1bc95232.pt --data_range 1-100/101-105 --n_threads 0 --use_dwconv --use_ca

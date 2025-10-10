@@ -143,6 +143,12 @@ parser.add_argument('--save_results', action='store_true',
 parser.add_argument('--save_gt', action='store_true',
                     help='save low-resolution and high-resolution images together')
 
+# DW CA
+parser.add_argument('--use_dwconv', action='store_true',
+                    help='Use depthwise separable convolution in Residual Blocks')
+parser.add_argument('--use_ca', action='store_true',
+                    help='Use channel attention in Residual Blocks')
+
 args = parser.parse_args()
 template.set_template(args)
 
