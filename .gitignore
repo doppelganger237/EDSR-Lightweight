@@ -68,3 +68,6 @@ target/
 # Datasets
 data/
 test/
+
+# Note
+notes/
