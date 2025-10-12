@@ -237,3 +237,56 @@ def make_optimizer(args, target):
     optimizer._register_scheduler(scheduler_class, **kwargs_scheduler)
     return optimizer
 
+def calc_ssim(sr, hr, scale):
+    """
+    计算结构相似性指数（SSIM）
+    输入：
+        sr: 超分辨率图像，Tensor，形状为 (N, C, H, W)，值范围假设为[0, 1]
+        hr: 高分辨率真实图像，Tensor，形状同上
+        scale: 裁剪边缘的像素数，用于忽略边缘效应
+    输出：
+        ssim_value: 计算得到的SSIM值（标量）
+    说明：
+        - 自动将RGB图像转换为灰度（Y通道），以更符合人眼感知
+        - 裁剪边缘区域，避免边缘效应对指标的影响
+        - 纯PyTorch实现，无需外部库
+    """
+    # 如果输入为RGB图像，则转换为灰度图像，使用ITU-R BT.601标准加权系数
+    if sr.size(1) == 3:
+        # Y通道转换系数
+        r, g, b = 0.2989, 0.5870, 0.1140
+        # 计算灰度图像
+        sr_gray = r * sr[:,0,:,:] + g * sr[:,1,:,:] + b * sr[:,2,:,:]
+        hr_gray = r * hr[:,0,:,:] + g * hr[:,1,:,:] + b * hr[:,2,:,:]
+    else:
+        # 如果已经是单通道，直接使用
+        sr_gray = sr[:,0,:,:]
+        hr_gray = hr[:,0,:,:]
+
+    # 裁剪边缘，避免边缘效应
+    if scale > 0:
+        sr_gray = sr_gray[..., scale:-scale, scale:-scale]
+        hr_gray = hr_gray[..., scale:-scale, scale:-scale]
+
+    # 计算均值
+    mu_sr = sr_gray.mean(dim=(-2,-1), keepdim=True)
+    mu_hr = hr_gray.mean(dim=(-2,-1), keepdim=True)
+
+    # 计算方差和协方差
+    sigma_sr = ((sr_gray - mu_sr)**2).mean(dim=(-2,-1), keepdim=True)
+    sigma_hr = ((hr_gray - mu_hr)**2).mean(dim=(-2,-1), keepdim=True)
+    sigma_sr_hr = ((sr_gray - mu_sr)*(hr_gray - mu_hr)).mean(dim=(-2,-1), keepdim=True)
+
+    # SSIM参数，防止分母为0
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    # 计算SSIM
+    numerator = (2 * mu_sr * mu_hr + C1) * (2 * sigma_sr_hr + C2)
+    denominator = (mu_sr**2 + mu_hr**2 + C1) * (sigma_sr + sigma_hr + C2)
+    ssim_map = numerator / denominator
+
+    # 对batch中所有图像求平均，得到标量SSIM
+    ssim_value = ssim_map.mean().item()
+
+    return ssim_value
