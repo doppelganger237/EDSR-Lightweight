@@ -114,22 +114,32 @@ class checkpoint():
         self.log_file.close()
 
     def plot_psnr(self, epoch):
-        axis = np.linspace(1, epoch, epoch)
+        # 根据 self.log 实际长度动态生成横轴
+        n_epochs = self.log.size(0)
+        axis = np.arange(1, n_epochs + 1)
+
         for idx_data, d in enumerate(self.args.data_test):
-            label = 'SR on {}'.format(d)
+            label = f'SR on {d}'
             fig = plt.figure()
             plt.title(label)
             for idx_scale, scale in enumerate(self.args.scale):
-                plt.plot(
-                    axis,
-                    self.log[:, idx_data, idx_scale].numpy(),
-                    label='Scale {}'.format(scale)
-                )
+                # 安全检查，防止索引越界或维度不匹配
+                if self.log.ndim == 3:
+                    y_data = self.log[:, idx_data, idx_scale].numpy()
+                elif self.log.ndim == 2:
+                    y_data = self.log[:, idx_data].numpy()
+                else:
+                    y_data = self.log.numpy()
+
+                # 确保横纵长度一致
+                min_len = min(len(axis), len(y_data))
+                plt.plot(axis[:min_len], y_data[:min_len], label=f'Scale {scale}')
+
             plt.legend()
             plt.xlabel('Epochs')
             plt.ylabel('PSNR')
             plt.grid(True)
-            plt.savefig(self.get_path('test_{}.pdf'.format(d)))
+            plt.savefig(self.get_path(f'test_{d}.pdf'))
             plt.close(fig)
 
     
@@ -248,7 +258,7 @@ def calc_ssim(sr, hr, scale, rgb_range=255):
     sr = sr / rgb_range
     hr = hr / rgb_range
 
-    # 转灰度
+    # 转灰度，确保得到 HxW 的张量
     if sr.size(1) == 3:
         sr_gray = 0.2989 * sr[:, 0, :, :] + 0.5870 * sr[:, 1, :, :] + 0.1140 * sr[:, 2, :, :]
         hr_gray = 0.2989 * hr[:, 0, :, :] + 0.5870 * hr[:, 1, :, :] + 0.1140 * hr[:, 2, :, :]
@@ -256,32 +266,33 @@ def calc_ssim(sr, hr, scale, rgb_range=255):
         sr_gray = sr[:, 0, :, :]
         hr_gray = hr[:, 0, :, :]
 
-    # 裁剪边缘
+    # 裁剪边缘，保持与 calc_psnr 一致的策略
     if scale > 0:
+        # 只裁剪最后两个维度 H 和 W
         sr_gray = sr_gray[..., scale:-scale, scale:-scale]
         hr_gray = hr_gray[..., scale:-scale, scale:-scale]
 
     # 定义 11x11 高斯核
     def gaussian(window_size=11, sigma=1.5):
-        coords = torch.arange(window_size).float() - window_size // 2
+        coords = torch.arange(window_size).float() - (window_size - 1) / 2
         g = torch.exp(-(coords**2) / (2 * sigma**2))
         g /= g.sum()
-        return g.unsqueeze(0) * g.unsqueeze(1)
+        return g.unsqueeze(1) @ g.unsqueeze(0)  # 生成二维高斯核
 
     kernel = gaussian().to(sr.device)
-    kernel = kernel.unsqueeze(0).unsqueeze(0)
+    kernel = kernel.unsqueeze(0).unsqueeze(0)  # 形状为 (1,1,11,11)
 
-    # 计算均值
-    mu1 = F.conv2d(sr_gray.unsqueeze(1), kernel, padding=0)
-    mu2 = F.conv2d(hr_gray.unsqueeze(1), kernel, padding=0)
+    # 计算均值，使用padding以保持大小一致
+    mu1 = F.conv2d(sr_gray.unsqueeze(1), kernel, padding=5)
+    mu2 = F.conv2d(hr_gray.unsqueeze(1), kernel, padding=5)
 
     mu1_sq = mu1 ** 2
     mu2_sq = mu2 ** 2
     mu1_mu2 = mu1 * mu2
 
-    sigma1_sq = F.conv2d(sr_gray.unsqueeze(1)**2, kernel, padding=0) - mu1_sq
-    sigma2_sq = F.conv2d(hr_gray.unsqueeze(1)**2, kernel, padding=0) - mu2_sq
-    sigma12 = F.conv2d((sr_gray.unsqueeze(1) * hr_gray.unsqueeze(1)), kernel, padding=0) - mu1_mu2
+    sigma1_sq = F.conv2d(sr_gray.unsqueeze(1)**2, kernel, padding=5) - mu1_sq
+    sigma2_sq = F.conv2d(hr_gray.unsqueeze(1)**2, kernel, padding=5) - mu2_sq
+    sigma12 = F.conv2d((sr_gray.unsqueeze(1) * hr_gray.unsqueeze(1)), kernel, padding=5) - mu1_mu2
 
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
