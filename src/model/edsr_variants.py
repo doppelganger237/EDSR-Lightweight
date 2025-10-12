@@ -497,7 +497,7 @@ def check_modules(net):
     has_dwconv = any(isinstance(m, nn.Conv2d) and m.groups == m.in_channels and m.kernel_size != (1,1)
                      for m in net.modules())
     has_ca = any(m.__class__.__name__ == "CALayer" for m in net.modules())
-    has_sa = any(m.__class__.__name__ == "SALayer" for m in net.modules())
+    has_sa = any(m.__class__.__name__ in ["SALayer", "LESA"] for m in net.modules())
     has_parallel = False
     for m in net.modules():
         if isinstance(m, ResidualBlock):

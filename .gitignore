@@ -68,6 +68,7 @@ target/
 # Datasets
 # data/
 # test/
+dataset/
 
 # Note
 notes/

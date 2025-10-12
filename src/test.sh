@@ -45,7 +45,7 @@
 # python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save edsr_attention_x2_ft --reset --epochs 20 --pre_train ../models/edsr_baseline_x2-1bc95232.pt --data_range 1-100/101-105 --n_threads 0 --use_ca
 
 # 4. EDSR + DWConv + Attention
-#python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save edsr_dwconv_attention_x2_ft --reset --epochs 20 --pre_train ../models/edsr_baseline_x2-1bc95232.pt --data_range 1-100/101-105 --n_threads 0 --use_dwconv --use_ca --use_sa
+#python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save edsr_dwconv_attention_x2_ft --reset --epochs 20 --data_range 1-100/101-105 --n_threads 0 --use_dwconv --use_ca --use_sa
 
 
 # -------------------------------
@@ -56,7 +56,7 @@
 # python main.py --data_test Set5+Set14 --scale 2 --pre_train ../experiment/edsr_baseline_x2_ft/model/model_best.pt --test_only --self_ensemble --save edsr_baseline_x2_bench --save_results --n_threads 0
 
 # 2. DWConv 验证
-# python main.py --data_test Set5+Set14 --scale 2 --pre_train ../experiment/edsr_dwconv_x2_ft/model/model_best.pt --test_only --self_ensemble --save edsr_dwconv_x2_bench --save_results --n_threads 0
+#python main.py --data_test Set5+Set14 --scale 2 --pre_train ../experiment/edsr_dwconv_x2_ft/model/model_best.pt --test_only --self_ensemble --save edsr_dwconv_x2_bench --save_results --n_threads 0
 
 # 3. Attention 验证
 # python main.py --data_test Set5+Set14 --scale 2 --pre_train ../experiment/edsr_attention_x2_ft/model/model_best.pt --test_only --self_ensemble --save edsr_attention_x2_bench --save_results --n_threads 0
@@ -64,3 +64,5 @@
 # 4. DWConv + Attention 验证
 #python main.py --data_test Set5+Set14 --scale 2 --pre_train ../experiment/edsr_dwconv_attention_x2_ft/model/model_best.pt --test_only --self_ensemble --save edsr_dwconv_attention_x2_bench --save_results --n_threads 0
 
+# test kaggle
+python main.py --model EDSR_VARIANTS --data_test Set5+Set14+DIV2K --scale 2 --pre_train ../models/model_latest.pt --test_only --self_ensemble --save kaggle_bench --save_results --n_threads 0 --data_range 801-900 --use_dwconv --use_ca --use_sa

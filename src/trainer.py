@@ -76,11 +76,14 @@ class Trainer():
 
         epoch = self.optimizer.get_last_epoch()
         self.ckp.write_log('\nEvaluation:')
-        self.ckp.add_log(
-            torch.zeros(1, len(self.loader_test), len(self.scale))
-        )
+        # 每个 epoch 新增一行 log（PSNR 和 SSIM 各一份）
+        self.ckp.add_log(torch.zeros(1, len(self.loader_test), len(self.scale)))
         if not hasattr(self.ckp, 'log_ssim'):
             self.ckp.log_ssim = torch.zeros_like(self.ckp.log)
+        else:
+            # 累积一行以保存新 epoch 的 SSIM
+            new_ssim_log = torch.zeros(1, len(self.loader_test), len(self.scale))
+            self.ckp.log_ssim = torch.cat([self.ckp.log_ssim, new_ssim_log], dim=0)
         self.model.eval()
 
         timer_test = utility.timer()

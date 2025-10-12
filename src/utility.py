@@ -16,6 +16,8 @@ import torch
 import torch.optim as optim
 import torch.optim.lr_scheduler as lrs
 
+import torch.nn.functional as F
+
 class timer():
     def __init__(self):
         self.acc = 0
@@ -237,56 +239,53 @@ def make_optimizer(args, target):
     optimizer._register_scheduler(scheduler_class, **kwargs_scheduler)
     return optimizer
 
-def calc_ssim(sr, hr, scale):
-    """
-    计算结构相似性指数（SSIM）
-    输入：
-        sr: 超分辨率图像，Tensor，形状为 (N, C, H, W)，值范围假设为[0, 1]
-        hr: 高分辨率真实图像，Tensor，形状同上
-        scale: 裁剪边缘的像素数，用于忽略边缘效应
-    输出：
-        ssim_value: 计算得到的SSIM值（标量）
-    说明：
-        - 自动将RGB图像转换为灰度（Y通道），以更符合人眼感知
-        - 裁剪边缘区域，避免边缘效应对指标的影响
-        - 纯PyTorch实现，无需外部库
-    """
-    # 如果输入为RGB图像，则转换为灰度图像，使用ITU-R BT.601标准加权系数
-    if sr.size(1) == 3:
-        # Y通道转换系数
-        r, g, b = 0.2989, 0.5870, 0.1140
-        # 计算灰度图像
-        sr_gray = r * sr[:,0,:,:] + g * sr[:,1,:,:] + b * sr[:,2,:,:]
-        hr_gray = r * hr[:,0,:,:] + g * hr[:,1,:,:] + b * hr[:,2,:,:]
-    else:
-        # 如果已经是单通道，直接使用
-        sr_gray = sr[:,0,:,:]
-        hr_gray = hr[:,0,:,:]
+def calc_ssim(sr, hr, scale, rgb_range=255):
+    """计算结构相似性指数（SSIM），采用局部窗口计算"""
+    if hr.nelement() == 1:
+        return 0
 
-    # 裁剪边缘，避免边缘效应
+    # 归一化到 [0, 1]
+    sr = sr / rgb_range
+    hr = hr / rgb_range
+
+    # 转灰度
+    if sr.size(1) == 3:
+        sr_gray = 0.2989 * sr[:, 0, :, :] + 0.5870 * sr[:, 1, :, :] + 0.1140 * sr[:, 2, :, :]
+        hr_gray = 0.2989 * hr[:, 0, :, :] + 0.5870 * hr[:, 1, :, :] + 0.1140 * hr[:, 2, :, :]
+    else:
+        sr_gray = sr[:, 0, :, :]
+        hr_gray = hr[:, 0, :, :]
+
+    # 裁剪边缘
     if scale > 0:
         sr_gray = sr_gray[..., scale:-scale, scale:-scale]
         hr_gray = hr_gray[..., scale:-scale, scale:-scale]
 
+    # 定义 11x11 高斯核
+    def gaussian(window_size=11, sigma=1.5):
+        coords = torch.arange(window_size).float() - window_size // 2
+        g = torch.exp(-(coords**2) / (2 * sigma**2))
+        g /= g.sum()
+        return g.unsqueeze(0) * g.unsqueeze(1)
+
+    kernel = gaussian().to(sr.device)
+    kernel = kernel.unsqueeze(0).unsqueeze(0)
+
     # 计算均值
-    mu_sr = sr_gray.mean(dim=(-2,-1), keepdim=True)
-    mu_hr = hr_gray.mean(dim=(-2,-1), keepdim=True)
+    mu1 = F.conv2d(sr_gray.unsqueeze(1), kernel, padding=0)
+    mu2 = F.conv2d(hr_gray.unsqueeze(1), kernel, padding=0)
 
-    # 计算方差和协方差
-    sigma_sr = ((sr_gray - mu_sr)**2).mean(dim=(-2,-1), keepdim=True)
-    sigma_hr = ((hr_gray - mu_hr)**2).mean(dim=(-2,-1), keepdim=True)
-    sigma_sr_hr = ((sr_gray - mu_sr)*(hr_gray - mu_hr)).mean(dim=(-2,-1), keepdim=True)
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
 
-    # SSIM参数，防止分母为0
+    sigma1_sq = F.conv2d(sr_gray.unsqueeze(1)**2, kernel, padding=0) - mu1_sq
+    sigma2_sq = F.conv2d(hr_gray.unsqueeze(1)**2, kernel, padding=0) - mu2_sq
+    sigma12 = F.conv2d((sr_gray.unsqueeze(1) * hr_gray.unsqueeze(1)), kernel, padding=0) - mu1_mu2
+
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
 
-    # 计算SSIM
-    numerator = (2 * mu_sr * mu_hr + C1) * (2 * sigma_sr_hr + C2)
-    denominator = (mu_sr**2 + mu_hr**2 + C1) * (sigma_sr + sigma_hr + C2)
-    ssim_map = numerator / denominator
-
-    # 对batch中所有图像求平均，得到标量SSIM
-    ssim_value = ssim_map.mean().item()
-
-    return ssim_value
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean().item()
