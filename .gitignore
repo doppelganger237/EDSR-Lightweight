@@ -66,9 +66,12 @@ target/
 .vscode
 
 # Datasets
-data/
-test/
+# data/
+# test/
 
 # Note
 notes/
 results/
+
+# macOS system files
+.DS_Store

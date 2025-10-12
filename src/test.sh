@@ -62,4 +62,5 @@
 # python main.py --data_test Set5+Set14 --scale 2 --pre_train ../experiment/edsr_attention_x2_ft/model/model_best.pt --test_only --self_ensemble --save edsr_attention_x2_bench --save_results --n_threads 0
 
 # 4. DWConv + Attention 验证
-python main.py --data_test Set5+Set14 --scale 2 --pre_train ../experiment/edsr_dwconv_attention_x2_ft/model/model_best.pt --test_only --self_ensemble --save edsr_dwconv_attention_x2_bench --save_results --n_threads 0
+#python main.py --data_test Set5+Set14 --scale 2 --pre_train ../experiment/edsr_dwconv_attention_x2_ft/model/model_best.pt --test_only --self_ensemble --save edsr_dwconv_attention_x2_bench --save_results --n_threads 0
+
