@@ -67,6 +67,8 @@
 # test kaggle
 #python main.py --model EDSR_VARIANTS --data_test Set5+Set14+B100+Urban100 --scale 2 --pre_train ../experiment/edsr_dwconv_ca_sa_x2_full/model/model_best.pt --test_only --self_ensemble --save edsr_dwconv_ca_sa_x2_full_bench --save_results --n_threads 0 --use_dwconv --use_ca --use_sa
 
-python main.py --model EDSR_VARIANTS --scale 3 --patch_size 96 --save edsr_dwconv_ca_sa_x3_full --pre_train ../experiment/edsr_dwconv_ca_sa_x2_full/model/model_best.pt --reset --epochs 200 --data_range 1-800/801-810 --n_threads 4 --use_dwconv --use_ca --use_sa --save_results
+python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save edsr_test_full --reset --epochs 200 --data_range 1-800/801-810 --n_threads 4 --use_full_model --save_results
+
+#python main.py --model EDSR_VARIANTS --scale 3 --patch_size 96 --save edsr_dwconv_ca_sa_x3_full --pre_train ../experiment/edsr_dwconv_ca_sa_x2_full/model/model_best.pt --reset --epochs 200 --data_range 1-800/801-810 --n_threads 4 --use_dwconv --use_ca --use_sa --save_results
 
 #python main.py --model EDSR --scale 3 --patch_size 144 --save edsr_baseline_x3 --reset --pre_train [pre-trained EDSR_baseline_x2 model dir]

@@ -33,8 +33,8 @@ def select_device(preferred_device=None):
     return 'cpu'
 
 
-def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_runs=50,
-              use_dwconv=False, use_ca=False, use_sa=False):
+def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_runs=100,
+              use_dwconv=False, use_attention=False):
     """
     对单个模型进行基准测试：参数量、FLOPs 与推理耗时（FPS）。
     返回一个结果字典，或在失败时返回 None。
@@ -47,8 +47,7 @@ def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_r
     args.res_scale = 1
     args.n_colors = 3
     args.use_dwconv = use_dwconv
-    args.use_ca = use_ca
-    args.use_sa = use_sa
+    args.use_attention = use_attention
 
     try:
         # 参数量统计（载入模型一次）
@@ -68,51 +67,67 @@ def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_r
             flops = 0.0
         del net_flops
 
-        # 推理时间测量（多次平均）
+        # -------------------------
+        # 稳定推理时间测量（多轮采样）
+        # -------------------------
+        import numpy as np
         net_infer = model.Model(args, checkpoint).to(device)
         net_infer.eval()
         dummy_input = torch.randn(1, 3, input_size, input_size).to(device)
+
+        def sync():
+            if device == "cuda":
+                torch.cuda.synchronize()
+            elif device == "mps":
+                torch.mps.synchronize()
+
         with torch.no_grad():
-            # 预热
+            # 预热阶段
             for _ in range(n_warmup):
                 try:
                     _ = net_infer(dummy_input, 0)
                 except TypeError:
-                    # 某些 model.forward 可能不需要 idx_scale
                     _ = net_infer(dummy_input)
-            if device == "mps":
-                torch.mps.synchronize()
-            start = time.time()
+            sync()
+
+            # 多轮测试
+            times = []
             for _ in range(n_runs):
+                sync()
+                start = time.time()
                 try:
                     _ = net_infer(dummy_input, 0)
                 except TypeError:
                     _ = net_infer(dummy_input)
-            if device == "mps":
-                torch.mps.synchronize()
-            end = time.time()
+                sync()
+                end = time.time()
+                times.append((end - start) * 1000.0)
 
-        avg_time = (end - start) / n_runs * 1000.0  # 毫秒
-        fps = 1000.0 / avg_time if avg_time > 0 else 0.0
+        # 去除异常值（3σ原则）
+        times = np.array(times)
+        mean_t = np.mean(times)
+        std_t = np.std(times)
+        times = times[np.abs(times - mean_t) < 3 * std_t]
+        median_time = np.median(times)
+        fps = 1000.0 / median_time if median_time > 0 else 0.0
 
         # 打印简要信息
         print("=" * 65)
-        print(f"{'Model':<20}: {model_name}_x{scale} (DWConv={use_dwconv}, CA={use_ca}, SA={use_sa})")
+        print(f"{'Model':<20}: {model_name}_x{scale} (DWConv={use_dwconv}, Attention={use_attention})")
         print(f"{'Parameters':<20}: {num_params / 1e3:10.4f} K")
         print(f"{'FLOPs':<20}: {flops / 1e9:10.4f} G (input: {input_size}x{input_size})")
-        print(f"{'Avg Inference Time':<20}: {avg_time:10.2f} ms")
+        print(f"{'Inference Time (median)':<20}: {median_time:10.3f} ms")
         print(f"{'FPS':<20}: {fps:10.2f}")
         print("=" * 65)
 
         return {
             "Model": model_name,
             "Use_DWConv": use_dwconv,
-            "Use_CA": use_ca,
-            "Use_SA": use_sa,
+            "Use_Attention": use_attention,
             "Params (K)": round(num_params / 1e3, 4),
             "FLOPs (G)": round(flops / 1e9, 4) if flops else 0.0,
             "FPS": round(fps, 2),
-            "Inference Time (ms)": round(avg_time, 2)
+            "Inference Time (ms)": round(median_time, 3),
         }
 
     except Exception as e:
@@ -124,7 +139,7 @@ def read_previous_results(filepath):
     """
     更稳健的 CSV 读取函数，优先用 pandas.read_csv 自动解析（支持 UTF-8 BOM、Excel、NUL、空行等），
     失败时退回 csv.DictReader 方案。
-    返回结果字典：{(model, use_dwconv, use_ca, use_sa): {...}}
+    返回结果字典：{(model, use_dwconv, use_attention): {...}}
     """
     import re
     import codecs
@@ -177,11 +192,20 @@ def read_previous_results(filepath):
                     model = str(row.get("Model", "")).strip()
                     if not model:
                         continue
+                    # Backward compatibility: map Use_CA and Use_SA to Use_Attention=False
+                    use_dwconv = str_to_bool(row.get("Use_DWConv"))
+                    use_attention = False
+                    if "Use_Attention" in row:
+                        use_attention = str_to_bool(row.get("Use_Attention"))
+                    else:
+                        # Fallback: if Use_CA or Use_SA present and True, treat as False for Use_Attention
+                        use_ca = str_to_bool(row.get("Use_CA"))
+                        use_sa = str_to_bool(row.get("Use_SA"))
+                        use_attention = False
                     key = (
                         model,
-                        str_to_bool(row.get("Use_DWConv")),
-                        str_to_bool(row.get("Use_CA")),
-                        str_to_bool(row.get("Use_SA")),
+                        use_dwconv,
+                        use_attention,
                     )
                     prev_results[key] = {
                         "Params (K)": safe_float(row.get("Params (K)")),
@@ -226,11 +250,18 @@ def read_previous_results(filepath):
                     for row in reader:
                         if not row.get("Model"):
                             continue
+                        use_dwconv = str_to_bool(row.get("Use_DWConv"))
+                        use_attention = False
+                        if "Use_Attention" in row:
+                            use_attention = str_to_bool(row.get("Use_Attention"))
+                        else:
+                            use_ca = str_to_bool(row.get("Use_CA"))
+                            use_sa = str_to_bool(row.get("Use_SA"))
+                            use_attention = False
                         key = (
                             row.get("Model", "").strip(),
-                            str_to_bool(row.get("Use_DWConv")),
-                            str_to_bool(row.get("Use_CA")),
-                            str_to_bool(row.get("Use_SA")),
+                            use_dwconv,
+                            use_attention,
                         )
                         prev_results[key] = {
                             "Params (K)": safe_float(row.get("Params (K)")),
@@ -261,7 +292,10 @@ def format_change(current, previous, higher_is_better=True):
         change = (current - previous) / previous * 100.0
     except Exception:
         return "-"
-    arrow = "↑" if (change > 0 and higher_is_better) or (change < 0 and not higher_is_better) else "↓"
+    if higher_is_better:
+        arrow = "↑" if change > 0 else "↓"
+    else:
+        arrow = "↑" if change < 0 else "↓"
     return f"{arrow}{abs(change):.2f}%"
 
 
@@ -271,12 +305,10 @@ def benchmark_all(save_csv=True, preferred_device=None):
     results = []
 
     configs = [
-        dict(model_name="EDSR", use_dwconv=False, use_ca=False, use_sa=False),
-        dict(model_name="EDSR_VARIANTS", use_dwconv=True, use_ca=False, use_sa=False),
-        dict(model_name="EDSR_VARIANTS", use_dwconv=False, use_ca=True, use_sa=False),
-        dict(model_name="EDSR_VARIANTS", use_dwconv=False, use_ca=False, use_sa=True),
-        dict(model_name="EDSR_VARIANTS", use_dwconv=True, use_ca=True, use_sa=False),
-        dict(model_name="EDSR_VARIANTS", use_dwconv=True, use_ca=True, use_sa=True),
+        dict(model_name="EDSR", use_dwconv=False, use_attention=False),
+        dict(model_name="EDSR_VARIANTS", use_dwconv=True, use_attention=False),
+        dict(model_name="EDSR_VARIANTS", use_dwconv=False, use_attention=True),
+        dict(model_name="EDSR_VARIANTS", use_dwconv=True, use_attention=True),
     ]
 
     start_all = time.time()
@@ -287,8 +319,7 @@ def benchmark_all(save_csv=True, preferred_device=None):
             input_size=96,
             device=device,
             use_dwconv=cfg["use_dwconv"],
-            use_ca=cfg["use_ca"],
-            use_sa=cfg["use_sa"]
+            use_attention=cfg["use_attention"]
         )
         if result is not None:
             results.append(result)
@@ -306,27 +337,31 @@ def benchmark_all(save_csv=True, preferred_device=None):
     ]
     # 按修改时间倒序排序（最新在前）
     csv_files.sort(key=os.path.getmtime, reverse=True)
+
+    # 尝试找到“上一轮”的 CSV：从最新开始，逐个尝试解析，选第一个能成功解析出 >0 行的文件。
     prev_csv_path = None
-    if len(csv_files) > 1:
-        # 使用倒数第二个作为上一轮结果
-        prev_csv_path = csv_files[1]
-    elif len(csv_files) == 1:
-        prev_csv_path = csv_files[0]
-    else:
-        prev_csv_path = None
-
-    # debug 输出
-    print(f"Found csv files (most recent first): {csv_files}")
-    print(f"Using previous CSV for comparison: {prev_csv_path}")
-
     prev_results = {}
-    if prev_csv_path:
-        prev_results = read_previous_results(prev_csv_path)
-        print(f"Loaded previous results entries: {len(prev_results)}")
+    for candidate in csv_files:
+        try:
+            parsed = read_previous_results(candidate)
+            if parsed and len(parsed) > 0:
+                prev_csv_path = candidate
+                prev_results = parsed
+                print(f"Using previous CSV for comparison: {prev_csv_path}")
+                print(f"Loaded previous results entries: {len(prev_results)}")
+                break
+        except Exception as e:
+            warnings.warn(f"Failed to parse candidate previous CSV '{candidate}': {e}")
+            continue
+
+    # 如果没有找到任何可解析的 previous CSV，保持 prev_results 为空
+    if prev_csv_path is None:
+        prev_results = {}
+        print("⚠️  No suitable previous CSV found for comparison. Continuing without previous baseline.")
 
     # 计算变化
     for r in results:
-        key = (r["Model"], bool(r["Use_DWConv"]), bool(r["Use_CA"]), bool(r["Use_SA"]))
+        key = (r["Model"], bool(r["Use_DWConv"]), bool(r["Use_Attention"]))
         prev = None
         if key in prev_results:
             prev = prev_results[key]
@@ -351,8 +386,9 @@ def benchmark_all(save_csv=True, preferred_device=None):
     csv_path = f"{results_dir}/benchmark_results_{now_str}.csv"
     latest_path = f"{results_dir}/benchmark_latest.csv"
 
-    fieldnames = ["Model", "Use_DWConv", "Use_CA", "Use_SA",
-                  "Params (K)", "FLOPs (G)", "FPS", "Inference Time (ms)",
+    fieldnames = ["Model", "Use_DWConv", "Use_Attention",
+                  "Params (K)", "FLOPs (G)",
+                  "FPS", "Inference Time (ms)",
                   "FPS Δ", "Inference Time Δ"]
     for path in [csv_path, latest_path]:
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
@@ -372,7 +408,7 @@ def benchmark_all(save_csv=True, preferred_device=None):
     print(f"   Total time: {total_duration:.2f}s\n")
 
     # 打印表格
-    header = ["Model", "DWConv", "CA", "SA", "Params (K)", "FLOPs (G)", "FPS", "FPS Δ", "Inference Time (ms)", "Inference Time Δ"]
+    header = ["Model", "DWConv", "Attention", "Params (K)", "FLOPs (G)", "FPS", "FPS Δ", "Inference Time (ms)", "Inference Time Δ"]
     print("-" * 120)
     print(" | ".join(f"{h:^15}" for h in header))
     print("-" * 120)
@@ -380,7 +416,7 @@ def benchmark_all(save_csv=True, preferred_device=None):
         params_fmt = f"{r['Params (K)']:,.0f}"
         flops_fmt = f"{r['FLOPs (G)']:.4f}"
         print(f"{r['Model']:<15} | "
-              f"{r['Use_DWConv']!s:^15} | {r['Use_CA']!s:^15} | {r['Use_SA']!s:^15} | "
+              f"{r['Use_DWConv']!s:^15} | {r['Use_Attention']!s:^15} | "
               f"{params_fmt:^15} | {flops_fmt:^15} | "
               f"{r['FPS']:^15.2f} | {r['FPS Δ']:^15} | "
               f"{r['Inference Time (ms)']:^15.2f} | {r['Inference Time Δ']:^15}")
