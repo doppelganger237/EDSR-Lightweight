@@ -45,8 +45,8 @@
 # python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save edsr_attention_x2_ft --reset --epochs 20 --pre_train ../models/edsr_baseline_x2-1bc95232.pt --data_range 1-100/101-105 --n_threads 0 --use_ca
 
 # 4. EDSR + DWConv + Attention
-python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save lumi_sr_full_x2_ft --reset --epochs 200 --data_range 1-100/101-105 --n_threads 0 --use_dwconv --use_attention
-
+#python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save lumi_sr_full_x2_ft --reset --epochs 200 --data_range 1-100/101-105 --n_threads 0 --use_dwconv --use_attention
+python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save lumisr_dwconv_attention_x2_full --reset --epochs 200 --data_range 1-800/801-810 --n_threads 4 --use_dwconv --use_attention --save_results
 
 # -------------------------------
 # 验证部分（Set5 + Set14）

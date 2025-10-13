@@ -238,7 +238,7 @@ def make_model(args, parent=False):
     """
     torch.manual_seed(42)
     net = EfficientEDSR(args)
-    #check_modules(net)  # 打印模型中使用的关键模块信息
+    check_modules(net)  # 打印模型中使用的关键模块信息
     return net
 
 ###############################################################################
