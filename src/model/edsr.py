@@ -80,7 +80,7 @@ class EDSR(nn.Module):
     # 如果权重维度匹配 → 正常加载
     # 如果不匹配且不是 tail 层 → 报错
     # tail 层是最后输出层（不同倍数时大小可能不同），所以可以忽略不匹配
-    # 👉 这就是为什么有时候你看到 strict=False，它允许“部分加载”，比如迁移学习。
+    # 👉 这就是为什么有时候看到 strict=False，它允许“部分加载”，比如迁移学习。
     def load_state_dict(self, state_dict, strict=True):
         own_state = self.state_dict()
         for name, param in state_dict.items():

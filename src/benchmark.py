@@ -98,7 +98,7 @@ def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_r
         # 打印简要信息
         print("=" * 65)
         print(f"{'Model':<20}: {model_name}_x{scale} (DWConv={use_dwconv}, CA={use_ca}, SA={use_sa})")
-        print(f"{'Parameters':<20}: {num_params / 1e6:10.4f} M")
+        print(f"{'Parameters':<20}: {num_params / 1e3:10.4f} K")
         print(f"{'FLOPs':<20}: {flops / 1e9:10.4f} G (input: {input_size}x{input_size})")
         print(f"{'Avg Inference Time':<20}: {avg_time:10.2f} ms")
         print(f"{'FPS':<20}: {fps:10.2f}")
@@ -109,7 +109,7 @@ def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_r
             "Use_DWConv": use_dwconv,
             "Use_CA": use_ca,
             "Use_SA": use_sa,
-            "Params (M)": round(num_params / 1e6, 4),
+            "Params (K)": round(num_params / 1e3, 4),
             "FLOPs (G)": round(flops / 1e9, 4) if flops else 0.0,
             "FPS": round(fps, 2),
             "Inference Time (ms)": round(avg_time, 2)
@@ -168,8 +168,8 @@ def read_previous_results(filepath):
                 for c in df.columns:
                     if c.strip().lower() == "flops":
                         col_map[c] = "FLOPs (G)"
-                    if c.strip().lower() == "params":
-                        col_map[c] = "Params (M)"
+                    if c.strip().lower() == "params (m)":
+                        col_map[c] = "Params (K)"
                 if col_map:
                     df = df.rename(columns=col_map)
                 parsed = 0
@@ -184,7 +184,7 @@ def read_previous_results(filepath):
                         str_to_bool(row.get("Use_SA")),
                     )
                     prev_results[key] = {
-                        "Params (M)": safe_float(row.get("Params (M)")),
+                        "Params (K)": safe_float(row.get("Params (K)")),
                         "FLOPs (G)": safe_float(row.get("FLOPs (G)")),
                         "FPS": safe_float(row.get("FPS")),
                         "Inference Time (ms)": safe_float(row.get("Inference Time (ms)")),
@@ -233,7 +233,7 @@ def read_previous_results(filepath):
                             str_to_bool(row.get("Use_SA")),
                         )
                         prev_results[key] = {
-                            "Params (M)": safe_float(row.get("Params (M)")),
+                            "Params (K)": safe_float(row.get("Params (K)")),
                             "FLOPs (G)": safe_float(row.get("FLOPs (G)")),
                             "FPS": safe_float(row.get("FPS")),
                             "Inference Time (ms)": safe_float(row.get("Inference Time (ms)")),
@@ -352,27 +352,36 @@ def benchmark_all(save_csv=True, preferred_device=None):
     latest_path = f"{results_dir}/benchmark_latest.csv"
 
     fieldnames = ["Model", "Use_DWConv", "Use_CA", "Use_SA",
-                  "Params (M)", "FLOPs (G)", "FPS", "Inference Time (ms)",
+                  "Params (K)", "FLOPs (G)", "FPS", "Inference Time (ms)",
                   "FPS Δ", "Inference Time Δ"]
     for path in [csv_path, latest_path]:
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for row in results:
-                writer.writerow({k: row.get(k, "") for k in fieldnames})
+                # Format Params (K) as integer with thousand separators
+                params_formatted = f"{row.get('Params (K)', 0):,.0f}"
+                # Format FLOPs (G) with 4 decimal places
+                flops_formatted = f"{row.get('FLOPs (G)', 0):.4f}"
+                out_row = row.copy()
+                out_row["Params (K)"] = params_formatted
+                out_row["FLOPs (G)"] = flops_formatted
+                writer.writerow({k: out_row.get(k, "") for k in fieldnames})
 
     print(f"\n✅ Results saved to {csv_path}")
     print(f"   Total time: {total_duration:.2f}s\n")
 
     # 打印表格
-    header = ["Model", "DWConv", "CA", "SA", "Params (M)", "FLOPs (G)", "FPS", "FPS Δ", "Inference Time (ms)", "Inference Time Δ"]
+    header = ["Model", "DWConv", "CA", "SA", "Params (K)", "FLOPs (G)", "FPS", "FPS Δ", "Inference Time (ms)", "Inference Time Δ"]
     print("-" * 120)
     print(" | ".join(f"{h:^15}" for h in header))
     print("-" * 120)
     for r in results:
+        params_fmt = f"{r['Params (K)']:,.0f}"
+        flops_fmt = f"{r['FLOPs (G)']:.4f}"
         print(f"{r['Model']:<15} | "
               f"{r['Use_DWConv']!s:^15} | {r['Use_CA']!s:^15} | {r['Use_SA']!s:^15} | "
-              f"{r['Params (M)']:^15.4f} | {r['FLOPs (G)']:^15.4f} | "
+              f"{params_fmt:^15} | {flops_fmt:^15} | "
               f"{r['FPS']:^15.2f} | {r['FPS Δ']:^15} | "
               f"{r['Inference Time (ms)']:^15.2f} | {r['Inference Time Δ']:^15}")
     print("-" * 120)

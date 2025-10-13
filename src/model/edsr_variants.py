@@ -443,9 +443,10 @@ class EDSR_Variant(nn.Module):
 
         # Tail部分
         m_tail = [
-            nn.PixelShuffle(scale),
-            nn.Conv2d(n_feats // (scale ** 2), args.n_colors, 1, padding=0)
+            common.Upsampler(conv, scale, n_feats, act=False),
+            nn.Conv2d(n_feats, args.n_colors, 3, padding=1)
         ]
+
 
         self.head = nn.Sequential(*m_head)
         self.body = nn.Sequential(*m_body)
@@ -463,7 +464,30 @@ class EDSR_Variant(nn.Module):
         x = self.tail(res)
         x = self.add_mean(x)
         return x
-
+    
+   # 这是自定义的权重加载函数：
+    # 如果权重维度匹配 → 正常加载
+    # 如果不匹配且不是 tail 层 → 报错
+    # tail 层是最后输出层（不同倍数时大小可能不同），所以可以忽略不匹配
+    # 👉 这就是为什么有时候看到 strict=False，它允许“部分加载”，比如迁移学习。
+    def load_state_dict(self, state_dict, strict=True):
+        own_state = self.state_dict()
+        for name, param in state_dict.items():
+            if name in own_state:
+                if isinstance(param, nn.Parameter):
+                    param = param.data
+                try:
+                    own_state[name].copy_(param)
+                except Exception:
+                    if name.find('tail') == -1:
+                        raise RuntimeError('While copying the parameter named {}, '
+                                           'whose dimensions in the model are {} and '
+                                           'whose dimensions in the checkpoint are {}.'
+                                           .format(name, own_state[name].size(), param.size()))
+            elif strict:
+                if name.find('tail') == -1:
+                    raise KeyError('unexpected key "{}" in state_dict'
+                                   .format(name))
 ###############################################################################
 # 模型构建工厂函数
 # - 根据args实例化EDSR_Variant并打印关键模块信息

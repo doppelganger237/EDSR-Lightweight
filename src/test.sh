@@ -39,7 +39,7 @@
 # python main.py --model EDSR --scale 2 --patch_size 96 --save edsr_baseline_x2_ft --reset --epochs 20 --pre_train ../models/edsr_baseline_x2-1bc95232.pt --data_range 1-100/101-105 --n_threads 0
 
 # 2. EDSR + DWConv
-python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save edsr_dwconv_x2_ft --load edsr_dwconv_x2_ft --epochs 20 --data_range 1-100/101-105 --n_threads 0 --use_dwconv
+#python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save edsr_dwconv_x2_ft --load edsr_dwconv_x2_ft --epochs 20 --data_range 1-100/101-105 --n_threads 0 --use_dwconv 
 
 # 3. EDSR + Attention
 # python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save edsr_attention_x2_ft --reset --epochs 20 --pre_train ../models/edsr_baseline_x2-1bc95232.pt --data_range 1-100/101-105 --n_threads 0 --use_ca
@@ -65,4 +65,8 @@ python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save edsr_dwcon
 #python main.py --data_test Set5+Set14 --scale 2 --pre_train ../experiment/edsr_dwconv_attention_x2_ft/model/model_best.pt --test_only --self_ensemble --save edsr_dwconv_attention_x2_bench --save_results --n_threads 0
 
 # test kaggle
-#python main.py --model EDSR_VARIANTS --data_test Set5+Set14+DIV2K --scale 2 --pre_train ../models/model_latest.pt --test_only --self_ensemble --save kaggle_bench --save_results --n_threads 0 --data_range 801-900 --use_dwconv --use_ca --use_sa
+#python main.py --model EDSR_VARIANTS --data_test Set5+Set14+B100+Urban100 --scale 2 --pre_train ../experiment/edsr_dwconv_ca_sa_x2_full/model/model_best.pt --test_only --self_ensemble --save edsr_dwconv_ca_sa_x2_full_bench --save_results --n_threads 0 --use_dwconv --use_ca --use_sa
+
+python main.py --model EDSR_VARIANTS --scale 3 --patch_size 96 --save edsr_dwconv_ca_sa_x3_full --pre_train ../experiment/edsr_dwconv_ca_sa_x2_full/model/model_best.pt --reset --epochs 200 --data_range 1-800/801-810 --n_threads 4 --use_dwconv --use_ca --use_sa --save_results
+
+#python main.py --model EDSR --scale 3 --patch_size 144 --save edsr_baseline_x3 --reset --pre_train [pre-trained EDSR_baseline_x2 model dir]
