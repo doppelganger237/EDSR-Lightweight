@@ -146,10 +146,9 @@ parser.add_argument('--save_gt', action='store_true',
 # DW CA SA
 parser.add_argument('--use_dwconv', action='store_true',
                     help='use depthwise separable convolution in residual blocks')
-parser.add_argument('--use_ca', action='store_true',
-                    help='use channel attention in residual blocks')
-parser.add_argument('--use_sa', action='store_true', 
-                    help='use spatial attention in residual blocks')
+parser.add_argument('--use_attention', action='store_true',
+                    help='use attention in residual blocks')
+
 
 args = parser.parse_args()
 template.set_template(args)
