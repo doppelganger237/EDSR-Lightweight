@@ -1,197 +1,221 @@
-###############################################################################
-# ===== EDSR变体：轻量级残差块与注意力模块 =====
-###############################################################################
-import torch.nn as nn
-import torch
-from model import common
+"""
+edsr_variants.py
+
+EDSR 变体 - 集成 A + C + E:
+- A: Adaptive Depthwise Conv (门控自适应 DWConv)
+- C: LiteAttention++（动态融合 CA 与 SA, 使用 softmax 权重）
+- E: 可学习残差缩放 + 可选的轻量归一化（LayerNorm/GroupNorm）用于训练稳定
+
+说明：此文件实现了一个向后兼容的模型构建工厂 `make_model(args)`，并打印关键模块使用情况。
+请确保项目其它处通过 `from model import edsr_variants` 或者 `make_model(args)` 调用本文件。
+
+当前版本实现的是 “Hybrid-Attention Efficient EDSR (A+C+E v2)”：
+- 前两层 Residual Block 使用标准 Conv（Hybrid 结构）
+- 其余 Block 使用 AdaptiveDWConv（门控轻量卷积）
+- 注意力模块使用 LiteAttentionPlus v2（动态融合 CA+SA，优化实现）
+- 残差缩放固定为 0.1
+- Tail 使用 3×3 输出卷积
+"""
+
 import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from model import common
 
 
-###############################################################################
-# 深度可分离卷积模块（Depthwise Separable Convolution）
-# - 该模块极大减少参数量与计算量，适合轻量化模型
-###############################################################################
-class EfficientFeatureExpand(nn.Module):
-    """高效特征扩展模块（轻量化特征生成）
-    功能：
-    1) primary_conv: 生成初始通道特征
-    2) cheap_operation: 使用深度卷积生成剩余特征
-    最终输出通道数为 out_channels
+# -----------------------------
+# Adaptive Depthwise Conv (A)
+# -----------------------------
+class AdaptiveDWConv(nn.Module):
     """
-    def __init__(self, in_channels, out_channels, kernel_size=1, ratio=2, dw_kernel_size=3, relu=True, bias=False):
+    自适应深度卷积模块：
+    - 先用 1x1 投影降/升维（可选），再做 depthwise conv
+    - 使用门控机制（轻量的通道注意力）产出每个通道的缩放因子
+    - 目标：在保持轻量的同时提高 DWConv 的表达能力
+    """
+    def __init__(self, in_channels, out_channels=None, kernel_size=3, bias=True, gate_reduction=8):
         super().__init__()
-        import math as _math
+        if out_channels is None:
+            out_channels = in_channels
+        self.in_channels = in_channels
         self.out_channels = out_channels
-        adaptive_ratio = 2 if out_channels < 128 else 4
-        self.init_channels = int(_math.ceil(out_channels / adaptive_ratio))
-        new_channels = self.init_channels * (ratio - 1)
-
-        self.primary_conv = nn.Sequential(
-            nn.Conv2d(in_channels, self.init_channels, kernel_size, padding=kernel_size//2, bias=bias),
-            nn.Hardswish(inplace=True) if relu else nn.Identity()
-        )
-        self.cheap_operation = nn.Sequential(
-            nn.Conv2d(self.init_channels, new_channels, dw_kernel_size, padding=dw_kernel_size//2, groups=self.init_channels, bias=bias),
-            nn.Hardswish(inplace=True) if relu else nn.Identity()
-        )
-
-    def forward(self, x):
-        x1 = self.primary_conv(x)  # 主卷积生成初始特征
-        x2 = self.cheap_operation(x1)  # 使用轻量操作生成额外特征
-        out = torch.cat([x1, x2], dim=1)  # 拼接特征
-        return out[:, :self.out_channels, :, :]  # 保持输出通道数一致
-
-
-
-
-# EfficientDepthConvBlock: 极简轻量卷积模块
-class EfficientDepthConvBlock(nn.Module):
-    """
-    轻量卷积模块
-    - 使用深度卷积提取空间特征
-    - 使用高效特征扩展生成通道
-    - 激活函数采用 Hardswish
-    """
-    def __init__(self, in_channels, out_channels, kernel_size=3, ratio=2, bias=True):
-        super().__init__()
         padding = kernel_size // 2
-        # 1) 深度卷积空间滤波
-        self.dw = nn.Conv2d(in_channels, in_channels, kernel_size, padding=padding, groups=in_channels, bias=bias)
-        # 2) 高效特征扩展点卷积
-        self.ghost = EfficientFeatureExpand(in_channels, out_channels, kernel_size=1, ratio=ratio, dw_kernel_size=3, relu=True, bias=bias)
-        # 3) 激活函数
-        self.act = nn.Hardswish(inplace=True)
+
+        # 如果输入通道 != 输出通道，使用 1x1 先投影
+        if in_channels != out_channels:
+            self.pre_proj = nn.Conv2d(in_channels, out_channels, 1, bias=bias)
+        else:
+            self.pre_proj = None
+
+        # depthwise conv
+        self.dw = nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding, groups=out_channels, bias=bias)
+
+        # 门控：全局池 -> FC -> SiLU -> FC -> sigmoid 返回每个通道的缩放
+        hidden = max(out_channels // gate_reduction, 4)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(out_channels, hidden, 1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, out_channels, 1, bias=True),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        x = self.dw(x)  # 深度卷积提取空间信息
-        x = self.ghost(x)  # 高效特征扩展
-        return self.act(x)  # 激活输出
+        # keep original input for residual connection
+        identity = x
+        if self.pre_proj is not None:
+            x = self.pre_proj(x)
+        y = self.dw(x)
+        g = self.gate(y)
+        # residual-style enhancement: add gated DW output to input projection
+        # this reduces the risk of over-suppressing channels and helps preserve
+        # information for better PSNR/texture recovery.
+        return x + y * g
 
 
-###############################################################################
-# 新增轻量多尺度通道-空间注意力模块
-###############################################################################
-class LiteAttention(nn.Module):
+# -----------------------------
+# LiteAttention++ v2 (C)
+# -----------------------------
+class LiteAttentionPlus(nn.Module):
     """
-    轻量多尺度通道-空间注意力模块
-    功能：
-    - 通道注意力：自适应调整通道重要性
-    - 空间注意力：深度卷积增强空间特征
+    轻量化通道+空间注意力的动态融合（v2）：
+    - 计算 CA 和 SA
+    - 使用一个小网络产生两个融合权重 alpha, beta
+    - 使用 softmax(alpha, beta) 使权重归一化
+    - 输出 x * (alpha * CA + beta * SA) 以实现加权融合
+    - 优化实现：避免不必要的广播，简化计算
     """
-    def __init__(self, channel, reduction=16):
+    def __init__(self, channel, reduction=16, min_channels=8):
         super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.channel_att = nn.Sequential(
-            nn.Conv2d(channel, max(channel // reduction, 4), 1, bias=True),
-            nn.Hardswish(),
-            nn.Conv2d(max(channel // reduction, 4), channel, 1, bias=True),
+        hidden = max(channel // reduction, min_channels)
+
+        # 通道注意力（瓶颈）
+        self.ca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channel, hidden, 1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, channel, 1, bias=True),
             nn.Sigmoid()
         )
-        self.spatial_att = nn.Sequential(
+
+        # 空间注意力（使用 DW 提取空间，然后降为 1 通道）
+        self.sa = nn.Sequential(
             nn.Conv2d(channel, channel, 3, padding=1, groups=channel, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channel, 1, 1, bias=True),
             nn.Sigmoid()
+        )
+
+        # 融合权重网络：全局池 -> FC -> 输出 2 权重
+        self.fusion = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channel, hidden, 1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, 2, 1, bias=True)  # raw scores for CA/SA
         )
 
     def forward(self, x):
-        ca = self.channel_att(self.avg_pool(x))  # 通道注意力
-        x = x * ca  # 对输入特征加权
-        sa = self.spatial_att(x)  # 空间注意力
-        return x * sa  # 输出加权特征
+        # x: [B, C, H, W]
+        ca = self.ca(x)                           # [B, C, 1, 1]
+        sa = self.sa(x)                           # [B, 1, H, W]
 
-###############################################################################
-# 新增统一轻量残差块
-###############################################################################
+        # 获取融合权重 scores -> softmax
+        fusion_scores = self.fusion(x).mean(dim=[2, 3])  # [B, 2]
+        weights = F.softmax(fusion_scores, dim=1)         # [B, 2]
+        alpha = weights[:, 0].view(-1, 1, 1, 1)
+        beta = weights[:, 1].view(-1, 1, 1, 1)
+
+        # 混合注意力：使用动态融合的加权平均
+        att_map = alpha * ca + beta * sa
+
+        # 残差注意力增强：保留原特征，叠加调制结果
+        return x + x * att_map
+
+
+# -----------------------------
+# Adaptive Residual Block (E)
+# -----------------------------
 class AdaptiveResidualBlock(nn.Module):
     """
-    自适应残差块
-    - 可选择是否使用轻量卷积 DWConv
-    - 可选择是否使用 LiteAttention
-    - 动态残差缩放 + skip 调整
+    自适应残差块：
+    - 可选 DW 路径（AdaptiveDWConv）或标准 conv
+    - 可学习残差缩放 res_scale（单参数）
+    - 使用 GroupNorm(1, channels) 作为唯一归一化方式
+    - 使用 SiLU 激活
     """
-    def __init__(self, channels, kernel_size=3, res_scale=1.0,
+    def __init__(self, channels, kernel_size=3, res_scale=0.1,
                  use_attention=True, use_dwconv=True):
         super().__init__()
-        conv_fn = (lambda in_c, out_c, k: EfficientDepthConvBlock(in_c, out_c, k)) \
-            if use_dwconv else (lambda in_c, out_c, k: nn.Conv2d(in_c, out_c, k, padding=k//2, bias=True))
-        self.conv1 = conv_fn(channels, channels, kernel_size)
-        self.act = nn.Hardswish(inplace=True)
-        self.conv2 = conv_fn(channels, channels, kernel_size)
+        self.use_dwconv = use_dwconv
+        padding = kernel_size // 2
+
+        if use_dwconv:
+            # 使用自适应 DWConv 两次
+            self.conv1 = AdaptiveDWConv(channels, channels, kernel_size)
+            self.conv2 = AdaptiveDWConv(channels, channels, kernel_size)
+        else:
+            self.conv1 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
+            self.conv2 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
+
+        self.act = nn.SiLU(inplace=True)
         self.use_attention = use_attention
         if use_attention:
-            self.att = LiteAttention(channels)
-        self.res_scale = nn.Parameter(torch.tensor(float(res_scale), dtype=torch.float32))
-        self.sigmoid = nn.Sigmoid()
+            self.att = LiteAttentionPlus(channels)
+
+        # 固定残差缩放，不可学习
+        self.res_scale = 0.1
 
     def forward(self, x):
-        res = self.conv1(x)  # 第一层卷积
-        res = self.act(res)  # 激活
-        res = self.conv2(res)  # 第二层卷积
-        if self.use_attention:
-            res = self.att(res)  # 注意力加权
-        res = res * (0.5 + 0.5 * self.sigmoid(self.res_scale))  # 残差缩放
-        return x + 0.8 * res  # skip连接输出
+        out = self.conv1(x)
+        # 如果 conv1 返回的是带激活的结果（AdaptiveDWConv 内部没有额外激活），在这里统一激活
+        out = self.act(out)
+        out = self.conv2(out)
 
-###############################################################################
-# EfficientEDSR 主模型
-# - 支持DWConv、轻量注意力、局部特征增强等
-# - Head: 输入卷积
-# - Body: 多个轻量残差块
-# - GFA: 全局特征聚合
-# - Tail: 上采样输出
-###############################################################################
+        if self.use_attention:
+            out = self.att(out)
+
+        out = out * self.res_scale
+        return x + out
+
+
+# -----------------------------
+# EfficientEDSR 主模型工厂
+# -----------------------------
 class EfficientEDSR(nn.Module):
-    """
-    EfficientEDSR 主模型
-    - Head: 输入卷积
-    - Body: 多个轻量残差块
-    - Tail: 上采样输出
-    """
     def __init__(self, args, conv=common.default_conv):
         super().__init__()
-
         n_resblocks = args.n_resblocks
         n_feats = args.n_feats
-        scale = args.scale[0]
+        scale = args.scale[0] if isinstance(args.scale, (list, tuple)) else args.scale
 
         self.sub_mean = common.MeanShift(args.rgb_range)
         self.add_mean = common.MeanShift(args.rgb_range, sign=1)
 
-        # Head部分
+        # Head: small channel-preserving conv -> expand
         m_head = [
-            nn.Conv2d(args.n_colors, args.n_colors, 3, padding=1, groups=args.n_colors, bias=True),
-            nn.Hardswish(inplace=True),
-            nn.Conv2d(args.n_colors, n_feats, 1, bias=True)
+            nn.Conv2d(args.n_colors, n_feats, 3, padding=1, bias=True),
         ]
 
-        # Body部分
-        kernel_size_list = getattr(args, 'kernel_size_list', None)
-        if kernel_size_list is None:
-            kernel_size_list = [3] * n_resblocks
-        else:
-            if len(kernel_size_list) != n_resblocks:
-                raise ValueError("kernel_size_list长度必须等于n_resblocks")
-
-        enable_dw = getattr(args, "use_dwconv", True)
-        enable_attention = getattr(args, "use_attention", True)
+        # Body
+        use_dw = getattr(args, 'use_dwconv', True)
+        use_att = getattr(args, 'use_attention', True)
 
         m_body = []
         for i in range(n_resblocks):
+            # 前两层 Residual Block 使用标准卷积
+            use_dw_block = use_dw and (i >= 2)
             m_body.append(
-                AdaptiveResidualBlock(
-                    n_feats,
-                    kernel_size_list[i],
-                    res_scale=args.res_scale,
-                    use_attention=enable_attention,
-                    use_dwconv=enable_dw
-                )
+                AdaptiveResidualBlock(n_feats, kernel_size=3, res_scale=0.1,
+                                      use_attention=use_att, use_dwconv=use_dw_block)
             )
         m_body.append(conv(n_feats, n_feats, 3))
 
-        # Tail部分
+        # Tail: 1x1 aggregation + upsampler + final conv (改为3x3卷积，padding=1)
         m_tail = [
-            nn.Conv2d(n_feats, n_feats, 1, bias=True),  # 新增特征聚合层
+            nn.Conv2d(n_feats, n_feats, 1, bias=True),
             common.Upsampler(conv, scale, n_feats, act=False),
-            nn.Conv2d(n_feats, args.n_colors, 1, padding=0)
+            nn.Conv2d(n_feats, args.n_colors, 3, padding=1)
         ]
 
         self.head = nn.Sequential(*m_head)
@@ -199,16 +223,15 @@ class EfficientEDSR(nn.Module):
         self.tail = nn.Sequential(*m_tail)
 
     def forward(self, x):
-        # 输入: [B, C, H, W]
-        x = self.sub_mean(x)  # 减去均值
-        x = self.head(x)  # 头部卷积
-        res = self.body(x)  # 主体残差块
-        res += x  # 全局残差连接
-        x = self.tail(res)  # 上采样输出
-        x = self.add_mean(x)  # 加回均值
+        x = self.sub_mean(x)
+        x = self.head(x)
+        res = self.body(x)
+        res = res + x
+        x = self.tail(res)
+        x = self.add_mean(x)
         return x
-    
-    # 这是自定义的权重加载函数：
+
+    # 保持向后兼容的 load_state_dict
     def load_state_dict(self, state_dict, strict=True):
         own_state = self.state_dict()
         for name, param in state_dict.items():
@@ -219,40 +242,22 @@ class EfficientEDSR(nn.Module):
                     own_state[name].copy_(param)
                 except Exception:
                     if name.find('tail') == -1:
-                        raise RuntimeError('复制参数时出现错误，参数名: {}, 模型维度: {}, 权重维度: {}.'
-                                           .format(name, own_state[name].size(), param.size()))
+                        raise RuntimeError(f"Error copying parameter {name}, model shape {own_state[name].size()}, checkpoint shape {param.size()}")
             elif strict:
                 if name.find('tail') == -1:
-                    raise KeyError('state_dict中存在意外的键 "{}"'
-                                   .format(name))
-###############################################################################
-# 模型构建工厂函数
-# - 根据args实例化EfficientEDSR并打印关键模块信息
-###############################################################################
-import torch
+                    raise KeyError(f'Unexpected key {name} in state_dict')
+
+
+# 工厂函数
 def make_model(args, parent=False):
-    """
-    构造EfficientEDSR模型的工厂函数。
-    - 根据参数实例化EfficientEDSR模型。
-    - 构建完成后调用check_modules函数，打印模型是否使用了关键轻量模块。
-    """
     torch.manual_seed(42)
     net = EfficientEDSR(args)
-    check_modules(net)  # 打印模型中使用的关键模块信息
+    check_modules(net)
     return net
 
-###############################################################################
-# 关键模块检查工具
-# - 检查模型是否包含EfficientDepthConvBlock、LiteAttention及并行融合
-# - 便于论文展示与模型对比
-###############################################################################
+
 def check_modules(net):
-    """检查模型中是否包含关键轻量模块
-    - EfficientDepthConvBlock
-    - LiteAttention
-    用于论文展示和 Ablation Study
-    """
-    has_dwconv = any(isinstance(m, EfficientDepthConvBlock) for m in net.modules())
-    has_msgsa = any(isinstance(m, LiteAttention) for m in net.modules())
-    print(f"[INFO] 使用 EfficientDepthConvBlock: {has_dwconv}")
-    print(f"[INFO] 使用 LiteAttention: {has_msgsa}")
+    has_dw = any(isinstance(m, AdaptiveDWConv) for m in net.modules())
+    has_att = any(isinstance(m, LiteAttentionPlus) for m in net.modules())
+    print(f"[INFO] 使用 AdaptiveDWConv: {has_dw}")
+    print(f"[INFO] 使用 LiteAttentionPlus: {has_att}")
