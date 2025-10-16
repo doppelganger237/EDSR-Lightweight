@@ -34,9 +34,10 @@ def select_device(preferred_device=None):
 
 
 def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_runs=100,
-              use_dwconv=False, use_attention=False):
+              use_dwconv=False, use_attention=False, use_fullres=False):
     """
     对单个模型进行基准测试：参数量、FLOPs 与推理耗时（FPS）。
+    use_fullres: 是否使用 HR=1280×720 口径计算 FLOPs，默认为 False。
     返回一个结果字典，或在失败时返回 None。
     """
     # 配置全局 args（与 main.py 保持一致）
@@ -52,14 +53,21 @@ def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_r
     try:
         # 参数量统计（载入模型一次）
         net_params = model.Model(args, checkpoint).to(device)
+        
         num_params = sum(p.numel() for p in net_params.parameters() if p.requires_grad)
         del net_params
+
+        # 计算 LR 输入尺寸
+        if use_fullres:
+            lr_h, lr_w = 720 // args.scale[0], 1280 // args.scale[0]
+        else:
+            lr_h = lr_w = input_size
 
         # FLOPs 统计（使用 thop profile）
         net_flops = model.Model(args, checkpoint).to(device)
         net_flops.eval()
         module_for_profile = getattr(net_flops, 'model', net_flops).to(device)
-        x = torch.randn(1, args.n_colors, input_size, input_size).to(device)
+        x = torch.randn(1, args.n_colors, lr_h, lr_w).to(device)
         try:
             flops, _ = profile(module_for_profile, inputs=(x,), verbose=False)
         except Exception as e:
@@ -73,7 +81,7 @@ def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_r
         import numpy as np
         net_infer = model.Model(args, checkpoint).to(device)
         net_infer.eval()
-        dummy_input = torch.randn(1, 3, input_size, input_size).to(device)
+        dummy_input = torch.randn(1, 3, lr_h, lr_w).to(device)
 
         def sync():
             if device == "cuda":
@@ -115,7 +123,10 @@ def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_r
         print("=" * 65)
         print(f"{'Model':<20}: {model_name}_x{scale} (DWConv={use_dwconv}, Attention={use_attention})")
         print(f"{'Parameters':<20}: {num_params / 1e3:10.4f} K")
-        print(f"{'FLOPs':<20}: {flops / 1e9:10.4f} G (input: {input_size}x{input_size})")
+        if use_fullres:
+            print(f"{'FLOPs':<20}: {flops / 1e9:10.4f} G (HR=1280×720, scale×{args.scale[0]})")
+        else:
+            print(f"{'FLOPs':<20}: {flops / 1e9:10.4f} G (input: {lr_w}×{lr_h})")
         print(f"{'Inference Time (median)':<20}: {median_time:10.3f} ms")
         print(f"{'FPS':<20}: {fps:10.2f}")
         print("=" * 65)
@@ -319,7 +330,8 @@ def benchmark_all(save_csv=True, preferred_device=None):
             input_size=96,
             device=device,
             use_dwconv=cfg["use_dwconv"],
-            use_attention=cfg["use_attention"]
+            use_attention=cfg["use_attention"],
+            use_fullres=False
         )
         if result is not None:
             results.append(result)

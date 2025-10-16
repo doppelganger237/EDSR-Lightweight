@@ -143,7 +143,7 @@ parser.add_argument('--save_results', action='store_true',
 parser.add_argument('--save_gt', action='store_true',
                     help='save low-resolution and high-resolution images together')
 
-# DW CA SA
+
 parser.add_argument('--use_dwconv', action='store_true',
                     help='use depthwise separable convolution in residual blocks')
 parser.add_argument('--use_attention', action='store_true',
