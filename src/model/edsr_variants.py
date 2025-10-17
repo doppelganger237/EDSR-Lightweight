@@ -96,19 +96,19 @@ class EfficientResidualBlock(nn.Module):
         # block index to decide attention frequency
         self.idx = idx
 
-        # learnable residual scaling (kept as a scalar parameter)
-        self.res_scale = nn.Parameter(torch.tensor(res_scale))
+        # learnable residual scaling as a parameter
+        self.res_scale = nn.Parameter(torch.tensor(res_scale, dtype=torch.float32))
 
     def forward(self, x):
         out = self.conv1(x)
         out = self.act(out)
         out = self.conv2(out)
 
-        # apply attention only every 4 blocks to reduce FLOPs
-        if self.att is not None and ((self.idx + 1) % 4 == 0):
+        # dynamic attention scheduling: enable more frequently in later layers
+        if self.att is not None and (self.idx % 3 == 0 or self.idx >= getattr(self, "total_blocks", 16) - 2):
             out = self.att(out)
 
-        out = out * torch.sigmoid(self.res_scale)
+        out = out * self.res_scale
         return x + out
 
 
@@ -126,20 +126,22 @@ class EfficientEDSRv2(nn.Module):
         m_head = [
             nn.Conv2d(args.n_colors, n_feats, 3, padding=1, bias=True),
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
-            nn.SiLU(inplace=True),
+            nn.ReLU(inplace=True),
         ]
 
         use_dw = getattr(args, 'use_dwconv', True)
         use_att = getattr(args, 'use_attention', True)
 
+        shared_att = ULAttention(n_feats, reduction=16) if use_att else None
+
         m_body = []
+        total_blocks = n_resblocks
         for i in range(n_resblocks):
             use_dw_block = use_dw and (i >= 2)
-            att_instance = ULAttention(n_feats, reduction=16) if use_att else None
-            m_body.append(
-                EfficientResidualBlock(n_feats, kernel_size=3, res_scale=0.1,
-                                       use_dwconv=use_dw_block, shared_att=att_instance, idx=i)
-            )
+            block = EfficientResidualBlock(n_feats, kernel_size=3, res_scale=0.1,
+                                           use_dwconv=use_dw_block, shared_att=shared_att, idx=i)
+            block.total_blocks = total_blocks
+            m_body.append(block)
         m_body.append(conv(n_feats, n_feats, 3))
 
         m_tail = [
@@ -161,19 +163,9 @@ class EfficientEDSRv2(nn.Module):
         blocks = body_layers[:-1]
 
         out = x
-        hier_skip = 0
-        for i, block in enumerate(blocks):
+        for block in blocks:
             out = block(out)
-            if (i + 1) % 8 == 0:
-                if isinstance(hier_skip, int):
-                    hier_skip = out
-                else:
-                    hier_skip = hier_skip + out
-        if isinstance(hier_skip, int):
-            res = last_conv(out)
-        else:
-            fused = out + hier_skip
-            res = last_conv(fused)
+        res = last_conv(out)
 
         res = res + x
         x = self.tail(res)
