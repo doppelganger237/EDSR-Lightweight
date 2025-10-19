@@ -68,16 +68,36 @@ class ULAttention(nn.Module):
         return x + out
 
 
+# NEW: GlobalULAttentionWrapper class for stage-level attention
+class GlobalULAttentionWrapper(nn.Module):
+    """
+    Wrapper that applies a lightweight 1x1 projection around ULAttention and
+    a learnable residual gating (alpha). This shrinks the parameter/FLOPs
+    impact while keeping attention global and stable when applied once per
+    body output (stage-level attention).
+    """
+    def __init__(self, channel, reduction=16, alpha=0.1):
+        super().__init__()
+        # small bottleneck projection to reduce compute and improve stability
+        self.proj_in = nn.Conv2d(channel, channel, kernel_size=1, bias=True)
+        self.att = ULAttention(channel, reduction=reduction)
+        self.proj_out = nn.Conv2d(channel, channel, kernel_size=1, bias=True)
+        # learnable scalar to control magnitude of the attention residual
+        self.alpha = nn.Parameter(torch.tensor(alpha, dtype=torch.float32))
+
+    def forward(self, x):
+        y = self.proj_in(x)
+        y = self.att(y)
+        y = self.proj_out(y)
+        return x + self.alpha * y
+
+
 class EfficientResidualBlock(nn.Module):
     """
-    EfficientResidualBlock: Residual block using GADWConv and a shared ULAttention
-    instance. The attention instance is provided from the parent model to enable
-    cross-layer parameter sharing and reduce total parameter count.
-
-    This optimized variant only applies the attention every 4 blocks to save FLOPs.
+    EfficientResidualBlock: Residual block using GADWConv.
     """
     def __init__(self, channels, kernel_size=3, res_scale=0.1,
-                 use_dwconv=True, shared_att=None, idx=0):
+                 use_dwconv=True, idx=0):
         super().__init__()
         self.use_dwconv = use_dwconv
         padding = kernel_size // 2
@@ -91,10 +111,6 @@ class EfficientResidualBlock(nn.Module):
 
         # use lightweight ReLU to reduce activation FLOPs compared to SiLU
         self.act = nn.ReLU(inplace=True)
-        # use the shared attention instance passed from the parent model
-        self.att = shared_att
-        # block index to decide attention frequency
-        self.idx = idx
 
         # learnable residual scaling as a parameter
         self.res_scale = nn.Parameter(torch.tensor(res_scale, dtype=torch.float32))
@@ -103,10 +119,6 @@ class EfficientResidualBlock(nn.Module):
         out = self.conv1(x)
         out = self.act(out)
         out = self.conv2(out)
-
-        # dynamic attention scheduling: enable more frequently in later layers
-        if self.att is not None and (self.idx % 3 == 0 or self.idx >= getattr(self, "total_blocks", 16) - 2):
-            out = self.att(out)
 
         out = out * self.res_scale
         return x + out
@@ -118,7 +130,6 @@ class EfficientEDSRv2(nn.Module):
         n_resblocks = args.n_resblocks
         n_feats = args.n_feats
         scale = args.scale[0] if isinstance(args.scale, (list, tuple)) else args.scale
-        # (removed unused shared attention instance)
 
         self.sub_mean = common.MeanShift(args.rgb_range)
         self.add_mean = common.MeanShift(args.rgb_range, sign=1)
@@ -132,17 +143,26 @@ class EfficientEDSRv2(nn.Module):
         use_dw = getattr(args, 'use_dwconv', True)
         use_att = getattr(args, 'use_attention', True)
 
-        shared_att = ULAttention(n_feats, reduction=16) if use_att else None
-
         m_body = []
         total_blocks = n_resblocks
         for i in range(n_resblocks):
             use_dw_block = use_dw and (i >= 2)
             block = EfficientResidualBlock(n_feats, kernel_size=3, res_scale=0.1,
-                                           use_dwconv=use_dw_block, shared_att=shared_att, idx=i)
+                                           use_dwconv=use_dw_block, idx=i)
             block.total_blocks = total_blocks
             m_body.append(block)
         m_body.append(conv(n_feats, n_feats, 3))
+
+        self.head = nn.Sequential(*m_head)
+        self.body = nn.Sequential(*m_body)
+
+        if use_att:
+            # use the wrapper that surrounds ULAttention with 1x1 projections
+            # and a small learnable residual weight for stability on stage-level
+            # attention (recommended for lightweight / DWConv models).
+            self.global_att = GlobalULAttentionWrapper(n_feats, reduction=16, alpha=0.1)
+        else:
+            self.global_att = None
 
         m_tail = [
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
@@ -150,8 +170,6 @@ class EfficientEDSRv2(nn.Module):
             nn.Conv2d(n_feats, args.n_colors, 3, padding=1)
         ]
 
-        self.head = nn.Sequential(*m_head)
-        self.body = nn.Sequential(*m_body)
         self.tail = nn.Sequential(*m_tail)
 
     def forward(self, x):
@@ -166,6 +184,9 @@ class EfficientEDSRv2(nn.Module):
         for block in blocks:
             out = block(out)
         res = last_conv(out)
+
+        if self.global_att is not None:
+            res = self.global_att(res)
 
         res = res + x
         x = self.tail(res)

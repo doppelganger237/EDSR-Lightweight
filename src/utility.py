@@ -2,8 +2,7 @@ import os
 import math
 import time
 import datetime
-from multiprocessing import Process
-from multiprocessing import Queue
+from concurrent.futures import ThreadPoolExecutor
 
 import matplotlib
 matplotlib.use('Agg')
@@ -44,11 +43,9 @@ class timer():
         self.acc = 0
 
 def bg_target(queue):
-    while True:
-        if not queue.empty():
-            filename, tensor = queue.get()
-            if filename is None: break
-            imageio.imwrite(filename, tensor.numpy())
+    # kept for backward compatibility; unused when using ThreadPoolExecutor
+    while False:
+        break
 
 class checkpoint():
     def __init__(self, args):
@@ -105,13 +102,33 @@ class checkpoint():
 
     def write_log(self, log, refresh=False):
         print(log)
-        self.log_file.write(log + '\n')
+        try:
+            self.log_file.write(log + '\n')
+            self.log_file.flush()
+        except Exception:
+            pass
         if refresh:
-            self.log_file.close()
+            try:
+                self.log_file.close()
+            except Exception:
+                pass
             self.log_file = open(self.get_path('log.txt'), 'a')
 
     def done(self):
-        self.log_file.close()
+        try:
+            if hasattr(self, 'executor'):
+                for f in getattr(self, '_futures', []):
+                    try:
+                        f.result()
+                    except Exception:
+                        pass
+                self.executor.shutdown(wait=True)
+        except Exception:
+            pass
+        try:
+            self.log_file.close()
+        except Exception:
+            pass
 
     def plot_psnr(self, epoch):
         # 根据 self.log 实际长度动态生成横轴
@@ -145,19 +162,21 @@ class checkpoint():
     
 
     def begin_background(self):
-        self.queue = Queue()
-
-        self.process = [
-            Process(target=bg_target, args=(self.queue,)) \
-            for _ in range(self.n_processes)
-        ]
-        
-        for p in self.process: p.start()
+        # Use a thread pool on macOS to avoid spawn/multiprocessing errors
+        # Keep a list of futures to ensure we can wait for all IO tasks
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        self._futures = []
 
     def end_background(self):
-        for _ in range(self.n_processes): self.queue.put((None, None))
-        while not self.queue.empty(): time.sleep(1)
-        for p in self.process: p.join()
+        # Wait for all scheduled image write tasks to finish and shutdown executor
+        if hasattr(self, 'executor'):
+            # wait for any submitted futures
+            for f in getattr(self, '_futures', []):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+            self.executor.shutdown(wait=True)
 
     def save_results(self, dataset, filename, save_list, scale):
         if self.args.save_results:
@@ -170,7 +189,14 @@ class checkpoint():
             for v, p in zip(save_list, postfix):
                 normalized = v[0].mul(255 / self.args.rgb_range)
                 tensor_cpu = normalized.byte().permute(1, 2, 0).cpu()
-                self.queue.put(('{}{}.png'.format(filename, p), tensor_cpu))
+                save_path = '{}{}.png'.format(filename, p)
+                # schedule asynchronous write using thread pool
+                if hasattr(self, 'executor'):
+                    future = self.executor.submit(imageio.imwrite, save_path, tensor_cpu.numpy())
+                    self._futures.append(future)
+                else:
+                    # fallback to synchronous write
+                    imageio.imwrite(save_path, tensor_cpu.numpy())
 
 def quantize(img, rgb_range):
     pixel_range = 255 / rgb_range

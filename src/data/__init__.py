@@ -1,4 +1,5 @@
 from importlib import import_module
+import torch
 #from dataloader import MSDataLoader
 from torch.utils.data import dataloader
 from torch.utils.data import ConcatDataset
@@ -27,7 +28,7 @@ class Data:
                 MyConcatDataset(datasets),
                 batch_size=args.batch_size,
                 shuffle=True,
-                pin_memory=not args.cpu,
+                pin_memory=torch.cuda.is_available() and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
                 num_workers=args.n_threads,
             )
 
@@ -46,7 +47,7 @@ class Data:
                     testset,
                     batch_size=1,
                     shuffle=False,
-                    pin_memory=not args.cpu,
+                    pin_memory=torch.cuda.is_available() and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
                     num_workers=args.n_threads,
                 )
             )
