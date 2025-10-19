@@ -210,7 +210,6 @@ class EfficientEDSRv2(nn.Module):
 
 
 def make_model(args, parent=False):
-    torch.manual_seed(42)
     net = EfficientEDSRv2(args)
     check_modules(net)
     return net
