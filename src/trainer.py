@@ -98,9 +98,9 @@ class Trainer():
 
                     save_list = [sr]
                     self.ckp.log[-1, idx_data, idx_scale] += utility.calc_psnr(
-                        sr, hr, scale, self.args.rgb_range, dataset=d
+                        sr, hr, scale, self.args.rgb_range, dataset=d, only_y=self.args.only_y
                     )
-                    ssim_val = utility.calc_ssim(sr, hr, scale)
+                    ssim_val = utility.calc_ssim(sr, hr, scale, only_y=self.args.only_y)
                     self.ckp.log_ssim[-1, idx_data, idx_scale] += ssim_val
                     if self.args.save_gt:
                         save_list.extend([lr, hr])

@@ -202,13 +202,25 @@ def quantize(img, rgb_range):
     pixel_range = 255 / rgb_range
     return img.mul(pixel_range).clamp(0, 255).round().div(pixel_range)
 
-def calc_psnr(sr, hr, scale, rgb_range, dataset=None):
+def calc_psnr(sr, hr, scale, rgb_range, dataset=None, only_y=False):
+    """
+    Calculate PSNR.
+    Parameters:
+    - only_y (bool): If True, calculate PSNR only on the Y channel (luminance).
+    """
     if hr.nelement() == 1: return 0
 
-    diff = (sr - hr) / rgb_range
+    if only_y and sr.size(1) == 3:
+        # Convert to Y channel using YCbCr conversion
+        y_sr = 0.257 * sr[:,0,:,:] + 0.504 * sr[:,1,:,:] + 0.098 * sr[:,2,:,:] + 16.0/255
+        y_hr = 0.257 * hr[:,0,:,:] + 0.504 * hr[:,1,:,:] + 0.098 * hr[:,2,:,:] + 16.0/255
+        diff = (y_sr - y_hr) / rgb_range
+    else:
+        diff = (sr - hr) / rgb_range
+
     if dataset and dataset.dataset.benchmark:
         shave = scale
-        if diff.size(1) > 1:
+        if diff.dim() == 4 and diff.size(1) > 1:
             gray_coeffs = [65.738, 129.057, 25.064]
             convert = diff.new_tensor(gray_coeffs).view(1, 3, 1, 1) / 256
             diff = diff.mul(convert).sum(dim=1)
@@ -275,40 +287,47 @@ def make_optimizer(args, target):
     optimizer._register_scheduler(scheduler_class, **kwargs_scheduler)
     return optimizer
 
-def calc_ssim(sr, hr, scale, rgb_range=255):
-    """计算结构相似性指数（SSIM），采用局部窗口计算"""
+def calc_ssim(sr, hr, scale, rgb_range=255, only_y=False):
+    """
+    Calculate Structural Similarity Index (SSIM).
+    Parameters:
+    - only_y (bool): If True, calculate SSIM only on the Y channel (luminance).
+    """
     if hr.nelement() == 1:
         return 0
 
-    # 归一化到 [0, 1]
+    # Normalize to [0,1]
     sr = sr / rgb_range
     hr = hr / rgb_range
 
-    # 转灰度，确保得到 HxW 的张量
-    if sr.size(1) == 3:
-        sr_gray = 0.2989 * sr[:, 0, :, :] + 0.5870 * sr[:, 1, :, :] + 0.1140 * sr[:, 2, :, :]
-        hr_gray = 0.2989 * hr[:, 0, :, :] + 0.5870 * hr[:, 1, :, :] + 0.1140 * hr[:, 2, :, :]
+    if only_y and sr.size(1) == 3:
+        # Convert to Y channel using YCbCr conversion
+        sr_gray = 0.257 * sr[:,0,:,:] + 0.504 * sr[:,1,:,:] + 0.098 * sr[:,2,:,:] + 16.0/255
+        hr_gray = 0.257 * hr[:,0,:,:] + 0.504 * hr[:,1,:,:] + 0.098 * hr[:,2,:,:] + 16.0/255
     else:
-        sr_gray = sr[:, 0, :, :]
-        hr_gray = hr[:, 0, :, :]
+        # Convert to grayscale if 3 channels, else keep first channel
+        if sr.size(1) == 3:
+            sr_gray = 0.2989 * sr[:, 0, :, :] + 0.5870 * sr[:, 1, :, :] + 0.1140 * sr[:, 2, :, :]
+            hr_gray = 0.2989 * hr[:, 0, :, :] + 0.5870 * hr[:, 1, :, :] + 0.1140 * hr[:, 2, :, :]
+        else:
+            sr_gray = sr[:, 0, :, :]
+            hr_gray = hr[:, 0, :, :]
 
-    # 裁剪边缘，保持与 calc_psnr 一致的策略
+    # Crop edges consistent with calc_psnr strategy
     if scale > 0:
-        # 只裁剪最后两个维度 H 和 W
         sr_gray = sr_gray[..., scale:-scale, scale:-scale]
         hr_gray = hr_gray[..., scale:-scale, scale:-scale]
 
-    # 定义 11x11 高斯核
+    # Define 11x11 Gaussian kernel
     def gaussian(window_size=11, sigma=1.5):
         coords = torch.arange(window_size).float() - (window_size - 1) / 2
         g = torch.exp(-(coords**2) / (2 * sigma**2))
         g /= g.sum()
-        return g.unsqueeze(1) @ g.unsqueeze(0)  # 生成二维高斯核
+        return g.unsqueeze(1) @ g.unsqueeze(0)  # 2D gaussian kernel
 
     kernel = gaussian().to(sr.device)
-    kernel = kernel.unsqueeze(0).unsqueeze(0)  # 形状为 (1,1,11,11)
+    kernel = kernel.unsqueeze(0).unsqueeze(0)  # shape (1,1,11,11)
 
-    # 计算均值，使用padding以保持大小一致
     mu1 = F.conv2d(sr_gray.unsqueeze(1), kernel, padding=5)
     mu2 = F.conv2d(hr_gray.unsqueeze(1), kernel, padding=5)
 

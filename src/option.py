@@ -143,6 +143,8 @@ parser.add_argument('--save_results', action='store_true',
 parser.add_argument('--save_gt', action='store_true',
                     help='save low-resolution and high-resolution images together')
 
+parser.add_argument('--only_y', action='store_true',
+                    help='compute PSNR/SSIM only on the Y channel')
 
 parser.add_argument('--use_dwconv', action='store_true',
                     help='use depthwise separable convolution in residual blocks')
@@ -165,4 +167,3 @@ for arg in vars(args):
         vars(args)[arg] = True
     elif vars(args)[arg] == 'False':
         vars(args)[arg] = False
-
