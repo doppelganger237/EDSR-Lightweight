@@ -10,11 +10,15 @@ args.n_threads = 0
 args.use_attention = True
 args.n_colors = 3  # 确保是3通道
 
-def count_attention_params(module):
+def count_attention_params(module, mode=None):
     total = 0
     cls_name = module.__class__.__name__.lower()
-    if any(name in cls_name for name in ['eca', 'esa', 'lsa', 'ccaattention', 'dila', 'ulattention', 'stageulattention']):
+    if mode == 'ul':
+        # For UL mode, sum all parameters of the module directly
         total += sum(p.numel() for p in module.parameters() if p.requires_grad)
+    else:
+        if any(name in cls_name for name in ['ca', 'ccaattention', 'eca', 'sa', 'esa', 'lsa', 'dila', 'stage']):
+            total += sum(p.numel() for p in module.parameters() if p.requires_grad)
     return total
 
 def benchmark_network_attention(args, input_size=None):
@@ -31,7 +35,7 @@ def benchmark_network_attention(args, input_size=None):
 
         total_params = 0
         for m in model.modules():
-            total_params += count_attention_params(m)
+            total_params += count_attention_params(m, mode=mode)
 
         total_params /= 1e3  # 转换为千参数
 
