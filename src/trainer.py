@@ -20,7 +20,7 @@ class Trainer():
         self.model = my_model
         self.loss = my_loss
         self.optimizer = utility.make_optimizer(args, self.model)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=getattr(args, "amp", False))
+        self.scaler = torch.amp.GradScaler("cuda", enabled=getattr(args, "amp", False))
 
         # Try to load GradScaler state if it exists
         scaler_path = os.path.join(ckp.dir, 'scaler.pt')
