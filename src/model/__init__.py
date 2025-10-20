@@ -48,22 +48,7 @@ class Model(nn.Module):
         self.idx_scale = idx_scale
         if hasattr(self.model, 'set_scale'):
             self.model.set_scale(idx_scale)
-
-        if self.training:
-            if self.n_GPUs > 1:
-                return P.data_parallel(self.model, x, range(self.n_GPUs))
-            else:
-                return self.model(x)
-        else:
-            if self.chop:
-                forward_function = self.forward_chop
-            else:
-                forward_function = self.model.forward
-
-            if self.self_ensemble:
-                return self.forward_x8(x, forward_function=forward_function)
-            else:
-                return forward_function(x)
+        return self.model(x)
 
     def save(self, apath, epoch, is_best=False):
         save_dirs = [os.path.join(apath, 'model_latest.pt')]

@@ -174,13 +174,13 @@ class Trainer():
             if torch.backends.mps.is_available():
                 device = torch.device('mps')
             elif torch.cuda.is_available():
-                device = torch.device('cuda')
+                device = torch.device(f'cuda:{getattr(self.args, "rank", 0)}')
             else:
                 device = torch.device('cpu')
         def _prepare(tensor):
-            if self.args.precision == 'half': tensor = tensor.half()
+            if self.args.precision == 'half':
+                tensor = tensor.half()
             return tensor.to(device)
-
         return [_prepare(a) for a in args]
 
     def terminate(self):

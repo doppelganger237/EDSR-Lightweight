@@ -9,8 +9,6 @@ import utility
 import os
 from datetime import datetime
 import warnings
-from model.edsr_variants import ULRNet, GADWResidualBlock, ULAttention, StageULAttention
-
 args.n_feats = 64
 args.n_resblocks = 16
 
@@ -224,4 +222,4 @@ def benchmark_all(save_csv=True, preferred_device=None):
 
 
 if __name__ == "__main__":
-    #benchmark_all(save_csv=True)
+    benchmark_all(save_csv=True)

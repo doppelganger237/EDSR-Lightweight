@@ -71,26 +71,9 @@ def main():
 
         # move / wrap model for distributed or single-GPU
         if use_ddp:
-            # try wrap inner nn.Module if present
-            if isinstance(_model, nn.Module):
-                _model = _model.to(device)
-                _model = nn.parallel.DistributedDataParallel(_model, device_ids=[local_rank])
-            else:
-                # try typical attributes
-                wrapped = False
-                for attr in ('model', 'net', 'module', 'network', 'generator', 'body'):
-                    if hasattr(_model, attr):
-                        mod = getattr(_model, attr)
-                        if isinstance(mod, nn.Module):
-                            mod = mod.to(device)
-                            mod = nn.parallel.DistributedDataParallel(mod, device_ids=[local_rank])
-                            setattr(_model, attr, mod)
-                            wrapped = True
-                            break
-                if not wrapped:
-                    print('[DDP] Warning: could not find inner nn.Module to wrap; running without DDP wrapping')
+            _model = _model.to(device)
+            _model = nn.parallel.DistributedDataParallel(_model, device_ids=[local_rank])
         else:
-            # single GPU move
             if isinstance(_model, nn.Module):
                 _model = _model.to(device)
             else:
@@ -115,40 +98,18 @@ def main():
 
         # Move / wrap model for distributed training if needed
         if use_ddp:
-            # Attempt to wrap inner nn.Module or the returned object itself
-            try:
-                if isinstance(_model, nn.Module):
-                    _model = _model.to(device)
-                    _model = nn.parallel.DistributedDataParallel(_model, device_ids=[local_rank])
-                else:
-                    wrapped = False
-                    for attr in ('model', 'net', 'module', 'network', 'generator', 'body'):
-                        if hasattr(_model, attr):
-                            mod = getattr(_model, attr)
-                            if isinstance(mod, nn.Module):
-                                mod = mod.to(device)
-                                mod = nn.parallel.DistributedDataParallel(mod, device_ids=[local_rank])
-                                setattr(_model, attr, mod)
-                                wrapped = True
-                                break
-                    if not wrapped:
-                        print('[DDP] Warning: could not find inner nn.Module to wrap; proceeding without DDP wrapping')
-            except Exception as e:
-                print(f'[DDP] Warning during wrapping: {e}')
+            _model = _model.to(device)
+            _model = nn.parallel.DistributedDataParallel(_model, device_ids=[local_rank])
         else:
-            # Single GPU: move model modules to device
-            try:
-                if isinstance(_model, nn.Module):
-                    _model = _model.to(device)
-                else:
-                    for attr in ('model', 'net', 'module', 'network', 'generator', 'body'):
-                        if hasattr(_model, attr):
-                            mod = getattr(_model, attr)
-                            if isinstance(mod, nn.Module):
-                                setattr(_model, attr, mod.to(device))
-                                break
-            except Exception as e:
-                print(f'[Init] Warning moving model to device: {e}')
+            if isinstance(_model, nn.Module):
+                _model = _model.to(device)
+            else:
+                for attr in ('model', 'net', 'module', 'network', 'generator', 'body'):
+                    if hasattr(_model, attr):
+                        mod = getattr(_model, attr)
+                        if isinstance(mod, nn.Module):
+                            setattr(_model, attr, mod.to(device))
+                            break
 
         t = Trainer(args, loader, _model, _loss, checkpoint)
 
