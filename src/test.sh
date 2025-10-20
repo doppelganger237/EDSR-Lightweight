@@ -13,7 +13,10 @@
 #python main.py --model EDSR --scale 2 --save EDSR_Baseline_x2 --epochs 300 --n_threads 0 --save_results
 # Test Baseline
 # Train Att_only
-python main.py --model EDSR_VARIANTS --scale 2  --patch_size 96 --batch_size 24 --save sr_attention_x2 --epochs 300 --n_threads 0 --use_attention --save_results
+#python main.py --model EDSR_VARIANTS --scale 2  --patch_size 96 --batch_size 24 --save sr_attention_x2 --epochs 300 --n_threads 0 --use_attention --save_results
+
+python main.py --model EDSR_VARIANTS --scale 2  --patch_size 96 --batch_size 24 --save sr_dw --epochs 300 --n_threads 0 --use_dwconv --save_results
+
 # Test Baseline
 #python main.py --model EDSR --data_test Set5+Set14+B100+Urban100 --scale 2 --pre_train ../models/edsr_baseline_x2-1bc95232.pt --test_only --n_threads 0 --self_ensemble
 

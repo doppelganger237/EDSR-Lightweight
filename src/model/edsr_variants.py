@@ -12,43 +12,6 @@ from model import common
 import math
 
 
-class GADWConv(nn.Module):
-    """
-    GADWConv: Asymmetric depthwise conv with grouped 1x1 gating conv.
-    The gate conv uses groups=4 when possible to reduce parameter cost.
-    """
-    def __init__(self, channels, kernel_size=3):
-        super().__init__()
-        padding = kernel_size // 2
-        # asymmetric depthwise: (1x3) then (3x1)
-        self.dw1 = nn.Conv2d(channels, channels, (1, 3), padding=(0, 1), groups=channels, bias=True)
-        self.dw2 = nn.Conv2d(channels, channels, (3, 1), padding=(1, 0), groups=channels, bias=True)
-        self.dw_dil3 = nn.Conv2d(channels, channels, 3, padding=2, dilation=2, groups=channels, bias=True)
-        # use grouped 1x1 gating to reduce params when channels divisible by 4
-        gate_groups = 4 if (channels % 4 == 0) else 1
-        self.gate_conv = nn.Conv2d(channels, channels, 1, groups=gate_groups, bias=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        # 主分支
-        out1 = self.dw1(x)
-        out1 = self.dw2(out1)
-
-        # 并联的扩张卷积分支
-        out2 = self.dw_dil3(x)
-
-        # 汇合两个分支
-        out = out1 + out2
-
-        # 轻量通道注意力（Attention-Guided Gate）
-        gp = x.mean(dim=(2, 3), keepdim=True)  # Global avg pooling (B,C,1,1)
-        ca_scale = torch.sigmoid(gp)           # Simple ECA-like modulation
-        gate = self.sigmoid(self.gate_conv(x) * ca_scale)
-
-        # 门控融合 + 残差连接
-        return out * gate + x
-
-
 # --- GADWConvLite: lightweight depthwise conv + ECA1D gating ---
 class GADWConvLite(nn.Module):
     """
@@ -277,6 +240,6 @@ def make_model(args, parent=False):
 
 
 def check_modules(net):
-    has_gadw = any(isinstance(m, GADWConv) for m in net.modules())
+    has_gadw = any(isinstance(m, GADWConvLite) for m in net.modules())
     has_ulatt = any(isinstance(m, ULAttention) for m in net.modules())
-    print(f"[INFO] GADWConv: {has_gadw}, ULAttention: {has_ulatt}")
+    print(f"[INFO] GADWConvLite: {has_gadw}, ULAttention: {has_ulatt}")
