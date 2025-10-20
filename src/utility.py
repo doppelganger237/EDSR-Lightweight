@@ -96,6 +96,9 @@ class checkpoint():
         self.plot_psnr(epoch)
         trainer.optimizer.save(self.dir)
         torch.save(self.log, self.get_path('psnr_log.pt'))
+        # Save AMP GradScaler state if available
+        if hasattr(trainer, "scaler") and trainer.scaler is not None:
+            torch.save(trainer.scaler.state_dict(), self.get_path('scaler.pt'))
 
     def add_log(self, log):
         self.log = torch.cat([self.log, log])
@@ -211,9 +214,9 @@ def calc_psnr(sr, hr, scale, rgb_range, dataset=None, only_y=False):
     if hr.nelement() == 1: return 0
 
     if only_y and sr.size(1) == 3:
-        # Convert to Y channel using YCbCr conversion
-        y_sr = 0.257 * sr[:,0,:,:] + 0.504 * sr[:,1,:,:] + 0.098 * sr[:,2,:,:] + 16.0/255
-        y_hr = 0.257 * hr[:,0,:,:] + 0.504 * hr[:,1,:,:] + 0.098 * hr[:,2,:,:] + 16.0/255
+        # Convert to Y channel using YCbCr conversion (revised coefficients)
+        y_sr = (65.738 * sr[:,0,:,:] + 129.057 * sr[:,1,:,:] + 25.064 * sr[:,2,:,:]) / 256.0 + 16.0/255
+        y_hr = (65.738 * hr[:,0,:,:] + 129.057 * hr[:,1,:,:] + 25.064 * hr[:,2,:,:]) / 256.0 + 16.0/255
         diff = (y_sr - y_hr) / rgb_range
     else:
         diff = (sr - hr) / rgb_range
@@ -301,9 +304,9 @@ def calc_ssim(sr, hr, scale, rgb_range=255, only_y=False):
     hr = hr / rgb_range
 
     if only_y and sr.size(1) == 3:
-        # Convert to Y channel using YCbCr conversion
-        sr_gray = 0.257 * sr[:,0,:,:] + 0.504 * sr[:,1,:,:] + 0.098 * sr[:,2,:,:] + 16.0/255
-        hr_gray = 0.257 * hr[:,0,:,:] + 0.504 * hr[:,1,:,:] + 0.098 * hr[:,2,:,:] + 16.0/255
+        # Convert to Y channel using YCbCr conversion (revised coefficients)
+        sr_gray = (65.738 * sr[:,0,:,:] + 129.057 * sr[:,1,:,:] + 25.064 * sr[:,2,:,:]) / 256.0 + 16.0/255
+        hr_gray = (65.738 * hr[:,0,:,:] + 129.057 * hr[:,1,:,:] + 25.064 * hr[:,2,:,:]) / 256.0 + 16.0/255
     else:
         # Convert to grayscale if 3 channels, else keep first channel
         if sr.size(1) == 3:

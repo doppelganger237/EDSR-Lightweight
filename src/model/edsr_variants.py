@@ -41,9 +41,14 @@ class ULAttention(nn.Module):
     re-projection to reduce parameter cost. Default reduction=16.
     This optimized variant uses ReLU and a lightweight spatial conv (k=3,p=1)
     to reduce FLOPs.
+    The att_mode controls which attention branches are enabled:
+      - 'ul': both CA and SA
+      - 'ca': only channel attention
+      - 'sa': only spatial attention
     """
-    def __init__(self, channel, reduction=16):
+    def __init__(self, channel, reduction=16, att_mode='ul'):
         super().__init__()
+        self.att_mode = att_mode
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         mid = max(1, channel // reduction)
         # first 1x1 reduces channel, second 1x1 restores; use groups for the restore when possible
@@ -59,30 +64,49 @@ class ULAttention(nn.Module):
         self.fuse = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
 
     def forward(self, x):
-        pooled = self.global_pool(x)
-        ca = torch.sigmoid(self.ca_conv(pooled))                           # (B, C, 1, 1)
-        sa = torch.sigmoid(self.sa_conv(torch.mean(x, dim=1, keepdim=True)))  # (B, 32, H, W) -> broadcast
-        # compute normalized fusion weights
-        w = torch.softmax(self.fuse, dim=0)
-        f1, f2 = w[0], w[1]
-        # broadcast CA to spatial shape
-        ca_map = ca.expand_as(x)
-        # if sa has channel != C, project it to C by simple repeat/interpolation
-        if sa.size(1) != x.size(1):
-            # use interpolation across channel dimension via repeat if small; this keeps it lightweight
-            sa_map = F.interpolate(sa, size=(x.size(2), x.size(3)), mode='bilinear', align_corners=False)
-            # if sa channels != C, tile or reduce/expand along channel dim
-            if sa_map.size(1) != x.size(1):
-                repeat_times = x.size(1) // sa_map.size(1)
-                if repeat_times >= 1 and x.size(1) % sa_map.size(1) == 0:
-                    sa_map = sa_map.repeat(1, repeat_times, 1, 1)
-                else:
-                    # fallback: project via a 1x1 conv-like linear mapping using simple expansion
-                    sa_map = sa_map.mean(dim=1, keepdim=True).repeat(1, x.size(1), 1, 1)
-        else:
-            sa_map = sa
-        out = x * (f1 * ca_map + f2 * sa_map)
-        return x + out
+        if self.att_mode == 'ca':
+            pooled = self.global_pool(x)
+            ca = torch.sigmoid(self.ca_conv(pooled))                           # (B, C, 1, 1)
+            ca_map = ca.expand_as(x)
+            out = x * ca_map
+            return x + out
+        elif self.att_mode == 'sa':
+            sa = torch.sigmoid(self.sa_conv(torch.mean(x, dim=1, keepdim=True)))  # (B, 32, H, W)
+            # if sa has channel != C, project it to C by simple repeat/interpolation
+            if sa.size(1) != x.size(1):
+                sa_map = F.interpolate(sa, size=(x.size(2), x.size(3)), mode='bilinear', align_corners=False)
+                if sa_map.size(1) != x.size(1):
+                    repeat_times = x.size(1) // sa_map.size(1)
+                    if repeat_times >= 1 and x.size(1) % sa_map.size(1) == 0:
+                        sa_map = sa_map.repeat(1, repeat_times, 1, 1)
+                    else:
+                        sa_map = sa_map.mean(dim=1, keepdim=True).repeat(1, x.size(1), 1, 1)
+            else:
+                sa_map = sa
+            out = x * sa_map
+            return x + out
+        else:  # 'ul' both CA and SA
+            pooled = self.global_pool(x)
+            ca = torch.sigmoid(self.ca_conv(pooled))                           # (B, C, 1, 1)
+            sa = torch.sigmoid(self.sa_conv(torch.mean(x, dim=1, keepdim=True)))  # (B, 32, H, W) -> broadcast
+            # compute normalized fusion weights
+            w = torch.softmax(self.fuse, dim=0)
+            f1, f2 = w[0], w[1]
+            # broadcast CA to spatial shape
+            ca_map = ca.expand_as(x)
+            # if sa has channel != C, project it to C by simple repeat/interpolation
+            if sa.size(1) != x.size(1):
+                sa_map = F.interpolate(sa, size=(x.size(2), x.size(3)), mode='bilinear', align_corners=False)
+                if sa_map.size(1) != x.size(1):
+                    repeat_times = x.size(1) // sa_map.size(1)
+                    if repeat_times >= 1 and x.size(1) % sa_map.size(1) == 0:
+                        sa_map = sa_map.repeat(1, repeat_times, 1, 1)
+                    else:
+                        sa_map = sa_map.mean(dim=1, keepdim=True).repeat(1, x.size(1), 1, 1)
+            else:
+                sa_map = sa
+            out = x * (f1 * ca_map + f2 * sa_map)
+            return x + out
 
 
 # NEW: StageULAttention class for stage-level attention
@@ -93,11 +117,12 @@ class StageULAttention(nn.Module):
     impact while keeping attention global and stable when applied once per
     body output (stage-level attention).
     """
-    def __init__(self, channel, reduction=16, alpha=0.25):
+    def __init__(self, channel, reduction=16, alpha=0.25, att_mode='stage'):
         super().__init__()
         # small bottleneck projection to reduce compute and improve stability
         self.proj_in = nn.Conv2d(channel, channel, kernel_size=1, bias=True)
-        self.att = ULAttention(channel, reduction=reduction)
+        # For stage attention, att_mode is fixed to 'ul' for ULAttention inside
+        self.att = ULAttention(channel, reduction=reduction, att_mode='ul')
         self.proj_out = nn.Conv2d(channel, channel, kernel_size=1, bias=True)
         # learnable scalar to control magnitude of the attention residual
         self.alpha = nn.Parameter(torch.tensor(alpha, dtype=torch.float32))
@@ -111,13 +136,14 @@ class StageULAttention(nn.Module):
 
 class GADWResidualBlock(nn.Module):
     """
-    GADWResidualBlock: Residual block using GADWConv and optional StageULAttention.
+    GADWResidualBlock: Residual block using GADWConv and optional attention.
     """
     def __init__(self, channels, kernel_size=3, res_scale=0.1,
-                 use_dwconv=True, idx=0, use_attention=True):
+                 use_dwconv=True, idx=0, use_attention=True, att_mode='stage'):
         super().__init__()
         self.use_dwconv = use_dwconv
         self.use_attention = use_attention
+        self.att_mode = att_mode
         padding = kernel_size // 2
 
         if use_dwconv:
@@ -133,11 +159,21 @@ class GADWResidualBlock(nn.Module):
         # learnable residual scaling as a parameter
         self.res_scale = nn.Parameter(torch.tensor(res_scale, dtype=torch.float32))
 
-        # Stage level attention with reduction=8 and alpha=0.25 by default
+        # Attention module selection based on att_mode
         if self.use_attention:
-            self.stage_att = StageULAttention(channels, reduction=8, alpha=0.25)
+            if self.att_mode == 'ul':
+                self.att_module = ULAttention(channels, reduction=16, att_mode='ul')
+            elif self.att_mode == 'stage':
+                self.att_module = StageULAttention(channels, reduction=8, alpha=0.25, att_mode='stage')
+            elif self.att_mode == 'ca':
+                self.att_module = ULAttention(channels, reduction=16, att_mode='ca')
+            elif self.att_mode == 'sa':
+                self.att_module = ULAttention(channels, reduction=16, att_mode='sa')
+            else:
+                # fallback to stage attention if unknown mode
+                self.att_module = StageULAttention(channels, reduction=8, alpha=0.25, att_mode='stage')
         else:
-            self.stage_att = None
+            self.att_module = None
 
     def forward(self, x):
         out = self.conv1(x)
@@ -145,8 +181,8 @@ class GADWResidualBlock(nn.Module):
         out = self.conv2(out)
 
         out = out * self.res_scale
-        if self.use_attention and self.stage_att is not None:
-            out = self.stage_att(out)
+        if self.use_attention and self.att_module is not None:
+            out = self.att_module(out)
             return x + out
         else:
             # skip attention (no additional attention module here, so just return residual)
@@ -171,13 +207,16 @@ class ULRNet(nn.Module):
 
         use_dw = getattr(args, 'use_dwconv', True)
         use_att = getattr(args, 'use_attention', True)
+        att_mode = getattr(args, 'att_mode', None)
+        if use_att and att_mode is None:
+            att_mode = 'stage'  # default when attention enabled but mode not specified
 
         m_body = []
         total_blocks = n_resblocks
         for i in range(n_resblocks):
             use_dw_block = use_dw
             block = GADWResidualBlock(n_feats, kernel_size=3, res_scale=0.1,
-                                           use_dwconv=use_dw_block, idx=i, use_attention=use_att)
+                                           use_dwconv=use_dw_block, idx=i, use_attention=use_att, att_mode=att_mode)
             block.total_blocks = total_blocks
             m_body.append(block)
         m_body.append(conv(n_feats, n_feats, 3))
@@ -233,11 +272,12 @@ class ULRNet(nn.Module):
 
 def make_model(args, parent=False):
     net = ULRNet(args)
-    check_modules(net)
+    check_modules(net, getattr(args, 'att_mode', None))
     return net
 
 
-def check_modules(net):
+def check_modules(net, att_mode=None):
     has_gadw = any(isinstance(m, GADWConv) for m in net.modules())
     has_ulatt = any(isinstance(m, ULAttention) for m in net.modules())
-    print(f"[INFO] GADWConv: {has_gadw}, ULAttention: {has_ulatt}")
+    att_mode_str = att_mode if att_mode is not None else 'None'
+    print(f"[INFO] GADWConv: {has_gadw}, ULAttention: {has_ulatt}, Attention Mode: {att_mode_str}")

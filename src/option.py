@@ -150,7 +150,10 @@ parser.add_argument('--use_dwconv', action='store_true',
                     help='use depthwise separable convolution in residual blocks')
 parser.add_argument('--use_attention', action='store_true',
                     help='use attention in residual blocks')
+parser.add_argument('--att_mode', type=str, default='stage', choices=['ca', 'sa', 'ul', 'stage'],
+                    help="control the type of Attention module to use ('ca', 'sa', 'ul', 'stage')")
 
+parser.add_argument('--amp', action='store_true', help='use automatic mixed precision training')
 
 args = parser.parse_args()
 template.set_template(args)

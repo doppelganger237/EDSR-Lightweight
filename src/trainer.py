@@ -8,6 +8,7 @@ import torch
 import torch.nn.utils as utils
 from tqdm import tqdm
 
+
 class Trainer():
     def __init__(self, args, loader, my_model, my_loss, ckp):
         self.args = args
@@ -19,11 +20,22 @@ class Trainer():
         self.model = my_model
         self.loss = my_loss
         self.optimizer = utility.make_optimizer(args, self.model)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=getattr(args, "amp", False))
+
+        # Try to load GradScaler state if it exists
+        scaler_path = os.path.join(ckp.dir, 'scaler.pt')
+        if os.path.exists(scaler_path):
+            try:
+                self.scaler.load_state_dict(torch.load(scaler_path))
+                ckp.write_log("[INFO] GradScaler state loaded successfully.")
+            except Exception as e:
+                ckp.write_log(f"[WARN] Failed to load GradScaler state: {e}")
 
         if self.args.load != '':
             self.optimizer.load(ckp.dir, epoch=len(ckp.log))
 
         self.error_last = 1e8
+        self.ckp.write_log(f"[INFO] AMP enabled: {getattr(self.args, 'amp', False)}")
 
     def train(self):
         self.loss.step()
@@ -45,15 +57,15 @@ class Trainer():
             timer_model.tic()
 
             self.optimizer.zero_grad()
-            sr = self.model(lr, 0)
-            loss = self.loss(sr, hr)
-            loss.backward()
+            with torch.amp.autocast("cuda", enabled=getattr(self.args, "amp", False)):
+                sr = self.model(lr, 0)
+                loss = self.loss(sr, hr)
+            self.scaler.scale(loss).backward()
             if self.args.gclip > 0:
-                utils.clip_grad_value_(
-                    self.model.parameters(),
-                    self.args.gclip
-                )
-            self.optimizer.step()
+                self.scaler.unscale_(self.optimizer)
+                utils.clip_grad_value_(self.model.parameters(), self.args.gclip)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             timer_model.hold()
 
@@ -127,6 +139,7 @@ class Trainer():
 
         self.ckp.write_log('Forward: {:.2f}s\n'.format(timer_test.toc()))
         self.ckp.write_log('Saving...')
+        self.ckp.write_log(f"[Checkpoint] Epoch {epoch}: model saved (AMP={getattr(self.args, 'amp', False)})")
 
         if self.args.save_results:
             self.ckp.end_background()
