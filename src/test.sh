@@ -10,8 +10,7 @@
 
 
 # Train Att_only
-python main.py --model EDSR_VARIANTS --scale 2 --patch_size 64  --batch_size 32 --save sr_attention_x2 --epochs 350 --n_threads 0 --use_attention --save_results 
-
+python main.py --model EDSR_VARIANTS --scale 2 --patch_size 64  --batch_size 32 --save sr_attention_x2 --epochs 350 --n_threads 0 --use_attention --save_results
 # Test Baseline
 #python main.py --model EDSR --data_test Set5+Set14+B100+Urban100 --scale 2 --pre_train ../models/edsr_baseline_x2-1bc95232.pt --test_only --n_threads 0 --self_ensemble
 
