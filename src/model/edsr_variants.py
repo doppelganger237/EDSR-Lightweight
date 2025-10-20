@@ -49,6 +49,34 @@ class GADWConv(nn.Module):
         return out * gate + x
 
 
+# --- GADWConvLite: lightweight depthwise conv + ECA1D gating ---
+class GADWConvLite(nn.Module):
+    """
+    GADWConvLite: simplified depthwise conv with lightweight ECA-style gating.
+    - 仅使用单层depthwise + ECA1D全局通道注意力
+    - 参数与计算量更低，适合与ULAttention共存
+    """
+    def __init__(self, channels, kernel_size=3):
+        super().__init__()
+        padding = kernel_size // 2
+        self.dw = nn.Conv2d(channels, channels, kernel_size, padding=padding, groups=channels, bias=True)
+        # adaptive ECA 1D kernel size based on channel count (keep small odd kernel)
+        t = int(abs((math.log2(max(1, channels)) * 2 + 1)))
+        k = t if (t % 2 == 1 and t >= 1) else max(3, t + 1)
+        k = min(k, channels) if channels > 1 else 3
+        self.eca_conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        out = self.dw(x)
+        y = x.mean(dim=(2, 3), keepdim=True)
+        y = y.squeeze(-1).permute(0, 2, 1)
+        y = self.eca_conv(y)
+        y = self.sigmoid(y.permute(0, 2, 1).unsqueeze(-1))
+        out = out * y + x
+        return out
+
+
 class ULAttention(nn.Module):
     """
     ULAttention (改良融合版)
@@ -75,8 +103,8 @@ class ULAttention(nn.Module):
 
         # learnable fusion weights and temperature
         self.fuse = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
-        # log temperature: initial 0 -> tau=1
-        self.log_tau = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        # log temperature: initial value for tau ~0.3
+        self.log_tau = nn.Parameter(torch.tensor(math.log(0.3), dtype=torch.float32))
 
     def forward(self, x):
         b, c, h, w = x.size()
@@ -121,8 +149,8 @@ class GADWResidualBlock(nn.Module):
         padding = kernel_size // 2
 
         if use_dwconv:
-            self.conv1 = GADWConv(channels)
-            self.conv2 = GADWConv(channels)
+            self.conv1 = GADWConvLite(channels)
+            self.conv2 = GADWConvLite(channels)
         else:
             self.conv1 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
             self.conv2 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
@@ -140,7 +168,7 @@ class GADWResidualBlock(nn.Module):
             self.att = ULAttention(channels, reduction=8)
             self.proj_out = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
             # learnable scalar to control magnitude of the attention residual
-            self.alpha = nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
+            self.alpha = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
         else:
             # placeholders to avoid attribute errors when attention disabled
             self.proj_in = None
