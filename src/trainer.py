@@ -35,16 +35,20 @@ class Trainer():
             self.optimizer.load(ckp.dir, epoch=len(ckp.log))
 
         self.error_last = 1e8
-        self.ckp.write_log(f"[INFO] AMP enabled: {getattr(self.args, 'amp', False)}")
+        # Determine whether this process should perform main logging/saving
+        self.is_main_process = (not getattr(self.args, 'distributed', False)) or (getattr(self.args, 'rank', 0) == 0)
+        if self.is_main_process:
+            self.ckp.write_log(f"[INFO] AMP enabled: {getattr(self.args, 'amp', False)}")
 
     def train(self):
         self.loss.step()
         epoch = self.optimizer.get_last_epoch() + 1
         lr = self.optimizer.get_lr()
 
-        self.ckp.write_log(
-            '[Epoch {}]\tLearning rate: {:.2e}'.format(epoch, Decimal(lr))
-        )
+        if self.is_main_process:
+            self.ckp.write_log(
+                '[Epoch {}]\tLearning rate: {:.2e}'.format(epoch, Decimal(lr))
+            )
         self.loss.start_log()
         self.model.train()
 
@@ -70,21 +74,30 @@ class Trainer():
             timer_model.hold()
 
             if (batch + 1) % self.args.print_every == 0:
-                self.ckp.write_log('[{}/{}]\t{}\t{:.1f}+{:.1f}s'.format(
-                    (batch + 1) * self.args.batch_size,
-                    len(self.loader_train.dataset),
-                    self.loss.display_loss(batch),
-                    timer_model.release(),
-                    timer_data.release()))
+                if self.is_main_process:
+                    self.ckp.write_log('[{}/{}]\t{}\t{:.1f}+{:.1f}s'.format(
+                        (batch + 1) * self.args.batch_size,
+                        len(self.loader_train.dataset),
+                        self.loss.display_loss(batch),
+                        timer_model.release(),
+                        timer_data.release()))
 
             timer_data.tic()
 
         self.loss.end_log(len(self.loader_train))
         self.error_last = self.loss.log[-1, -1]
         self.optimizer.schedule()
+        # Synchronize all processes at the end of each epoch in distributed mode
+        if getattr(self.args, 'distributed', False):
+            import torch.distributed as dist
+            if dist.is_initialized():
+                dist.barrier()
 
     def test(self):
         torch.set_grad_enabled(False)
+        # In distributed mode only run test on main process (rank 0)
+        if getattr(self.args, 'distributed', False) and getattr(self.args, 'rank', 0) != 0:
+            return
 
         epoch = self.optimizer.get_last_epoch()
         self.ckp.write_log('\nEvaluation:')
@@ -99,7 +112,8 @@ class Trainer():
         self.model.eval()
 
         timer_test = utility.timer()
-        if self.args.save_results: self.ckp.begin_background()
+        if self.is_main_process and self.args.save_results:
+            self.ckp.begin_background()
         for idx_data, d in enumerate(self.loader_test):
             for idx_scale, scale in enumerate(self.scale):
                 d.dataset.set_scale(idx_scale)
@@ -141,10 +155,10 @@ class Trainer():
         self.ckp.write_log('Saving...')
         self.ckp.write_log(f"[Checkpoint] Epoch {epoch}: model saved (AMP={getattr(self.args, 'amp', False)})")
 
-        if self.args.save_results:
+        if self.is_main_process and self.args.save_results:
             self.ckp.end_background()
 
-        if not self.args.test_only:
+        if not self.args.test_only and self.is_main_process:
             self.ckp.save(self, epoch, is_best=(best_psnr[1][0, 0] + 1 == epoch))
 
         self.ckp.write_log(

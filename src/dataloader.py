@@ -18,6 +18,7 @@ from torch.utils.data._utils import IS_WINDOWS
 from torch.utils.data._utils.worker import ManagerWatchdog
 
 from torch._six import queue
+from torch.utils.data.distributed import DistributedSampler
 
 def _ms_loop(dataset, index_queue, data_queue, done_event, collate_fn, scale, seed, init_fn, worker_id):
     try:
@@ -147,12 +148,29 @@ class _MSDataLoaderIter(_DataLoaderIter):
 
 class MSDataLoader(DataLoader):
 
-    def __init__(self, cfg, *args, **kwargs):
+    def __init__(self, cfg, dataset, *args, **kwargs):
+        # 如果处于分布式模式，使用 DistributedSampler；否则使用默认
+        if hasattr(cfg, 'distributed') and cfg.distributed:
+            self.sampler = DistributedSampler(dataset, shuffle=True)
+            shuffle = False
+        else:
+            self.sampler = None
+            shuffle = True
+
         super(MSDataLoader, self).__init__(
-            *args, **kwargs, num_workers=cfg.n_threads
+            dataset,
+            *args,
+            **kwargs,
+            num_workers=cfg.n_threads,
+            shuffle=shuffle,
+            sampler=self.sampler,
+            pin_memory=True
         )
         self.scale = cfg.scale
 
     def __iter__(self):
+        # 分布式 sampler 在每个 epoch 都要设置不同的随机种子
+        if self.sampler is not None and hasattr(self.sampler, 'set_epoch'):
+            import random
+            self.sampler.set_epoch(random.randint(0, 10000))
         return _MSDataLoaderIter(self)
-
