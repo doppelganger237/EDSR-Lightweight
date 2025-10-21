@@ -60,7 +60,8 @@ class GADWConvLite(nn.Module):
         y = self.eca_conv(y)
         y = self.sigmoid(y.permute(0, 2, 1).unsqueeze(-1))
         # Residual-style gating to control modulation strength
-        out = out + self.beta * (out * y - out)
+        beta = torch.clamp(self.beta, 0.0, 1.0)
+        out = out + beta * (out * y - out)
         # return the processed residual chunk (do not add input here — outer block handles residual add)
         return out
 
@@ -95,10 +96,13 @@ class ULAttentionPlus(nn.Module):
             self.sa_pw = None
 
         # Dynamic fusion gate replacing fixed softmax fusion weights
-        self.fuse_gate = nn.Sequential(
-            nn.Conv2d(channel, 2, 1, bias=True),
-            nn.Sigmoid()
-        )
+        self.fuse_gate = nn.Conv2d(channel, 2, 1, bias=True)
+        nn.init.constant_(self.fuse_gate.weight, 0.0)
+        nn.init.constant_(self.fuse_gate.bias, 0.0)
+        with torch.no_grad():
+            self.fuse_gate.bias[0] = math.log(0.7 / (1 - 0.7))
+            self.fuse_gate.bias[1] = math.log(0.3 / (1 - 0.3))
+        self.fuse_gate = nn.Sequential(self.fuse_gate, nn.Softmax(dim=1))
 
     def forward(self, x):
         b, c, h, w = x.size()
@@ -123,7 +127,8 @@ class ULAttentionPlus(nn.Module):
         out = x * (gate[:,0:1] * ca_map + (gate[:,1:2] * sa_map if isinstance(sa_map, torch.Tensor) else 0.0))
 
         # return attention-enhanced features (scaled). Outer block composes residuals.
-        return self.gamma * out
+        gamma = torch.clamp(self.gamma, 0.0, 2.0)
+        return gamma * out
 
 
 # Keep old ULAttention name for compatibility
@@ -202,8 +207,7 @@ class GADWResidualBlock(nn.Module):
             y_in = self.proj_in(out)
             # depth-gated attention response
             y_att = self.att(y_in) * self.depth_gate
-            delta = y_att - y_in
-            y = self.proj_out(delta)
+            y = self.proj_out(y_att)
             scaled_alpha = self.alpha * self.depth_gate
             return x + out + scaled_alpha * y
         else:
@@ -223,18 +227,18 @@ class ULRNet(nn.Module):
         m_head = [
             nn.Conv2d(args.n_colors, n_feats, 3, padding=1, bias=True),
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
-            nn.ReLU(inplace=True),
+            nn.PReLU(num_parameters=n_feats),
         ]
 
         use_dw = getattr(args, 'use_dwconv', True)
         use_att = getattr(args, 'use_attention', True)
 
         # new knobs (read via getattr, keep defaults safe)
-        att_start_ratio = float(getattr(args, 'att_start_ratio', 0.5))  # only last ~1/3 enable attention
-        att_depth_power = float(getattr(args, 'att_depth_power', 1.5))
+        att_start_ratio = float(getattr(args, 'att_start_ratio', 0.67))  # only last ~1/3 enable attention
+        att_depth_power = float(getattr(args, 'att_depth_power', 1.8))
         att_alpha_init = float(getattr(args, 'att_alpha_init', 0.1))
         att_gamma_init = float(getattr(args, 'att_gamma_init', 0.1))
-        att_spatial = bool(getattr(args, 'att_spatial', True))
+        att_spatial = bool(getattr(args, 'att_spatial', False))
         act_type = str(getattr(args, 'act', 'prelu'))
 
         m_body = []
