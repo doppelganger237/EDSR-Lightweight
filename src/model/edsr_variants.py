@@ -130,7 +130,7 @@ class ULAttentionPlus(nn.Module):
         out = x * (gate[:,0:1] * ca_map + (gate[:,1:2] * sa_map if isinstance(sa_map, torch.Tensor) else 0.0))
 
         # return attention-enhanced features (scaled). Outer block composes residuals.
-        gamma = torch.sigmoid(self.gamma) * 3.0
+        gamma = torch.sigmoid(self.gamma) * 3.0  # 动态比例映射到 (0,3)
         return gamma * out
 
 
@@ -411,8 +411,8 @@ class ULRNet(nn.Module):
         # full_mode下GC输出加到residual，增加gc_scale参数
         if self.full_mode and self.gc is not None:
             gc_out = self.gc(out)
-            gc_gate = torch.sigmoid(self.gc_scale)
-            res = res + gc_gate * gc_out
+            gate = torch.sigmoid(self.gc_scale)  # learnable soft gate
+            res = res + gate * gc_out
 
         res = res + x
         x = self.tail(res)
