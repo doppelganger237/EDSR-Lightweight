@@ -8,8 +8,10 @@
 # Train DW_only
 #python main.py --model EDSR_VARIANTS --scale 2 --patch_size 64  --n_resblocks 8 --save sr_dw_x2 --reset --epochs 300 --n_threads 0 --use_dwconv --save_results
 
-python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96  --save sr_att --epochs 300 --n_threads 0 --use_attention --save_results
+#python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96  --save sr_dwconv --epochs 300 --n_threads 1 --use_dwconv --save_results
 
+# 训练 Attention only
+python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96  --save sr_att --n_threads 1 --use_attention --save_results
 
 
 # Train Baseline

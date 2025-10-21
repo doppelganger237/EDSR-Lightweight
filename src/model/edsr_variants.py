@@ -12,6 +12,28 @@ from model import common
 import math
 
 
+# --- Helper: safe ECA kernel size computation ---
+def _eca_kernel_size(channels, gamma=2, b=1):
+    """Return an odd, valid 1D kernel size for ECA given channels. Always >=1 and <= channels (when channels>1).
+    Handles small channel counts robustly."""
+    if channels <= 1:
+        return 1
+    t = int(abs((math.log2(max(1, channels)) * gamma + b)))
+    # make t odd and at least 1
+    if t < 1:
+        t = 1
+    if t % 2 == 0:
+        t += 1
+    # bound to channels (make odd and >=1)
+    if t > channels:
+        k = channels if channels % 2 == 1 else (channels - 1 if channels > 1 else 1)
+    else:
+        k = t
+    if k < 1:
+        k = 1
+    return k
+
+
 # --- GADWConvLite: lightweight depthwise conv + ECA1D gating ---
 class GADWConvLite(nn.Module):
     """
@@ -23,10 +45,8 @@ class GADWConvLite(nn.Module):
         super().__init__()
         padding = kernel_size // 2
         self.dw = nn.Conv2d(channels, channels, kernel_size, padding=padding, groups=channels, bias=True)
-        # adaptive ECA 1D kernel size based on channel count (keep small odd kernel)
-        t = int(abs((math.log2(max(1, channels)) * 2 + 1)))
-        k = t if (t % 2 == 1 and t >= 1) else max(3, t + 1)
-        k = min(k, channels) if channels > 1 else 3
+        # adaptive ECA 1D kernel size (safe helper)
+        k = _eca_kernel_size(channels, gamma=2, b=1)
         self.eca_conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
         # learnable gating strength to avoid over-suppression in early training
@@ -41,34 +61,44 @@ class GADWConvLite(nn.Module):
         y = self.sigmoid(y.permute(0, 2, 1).unsqueeze(-1))
         # Residual-style gating to control modulation strength
         out = out + self.beta * (out * y - out)
-        return out + x
+        # return the processed residual chunk (do not add input here — outer block handles residual add)
+        return out
 
 
-class ULAttention(nn.Module):
+class ULAttentionPlus(nn.Module):
     """
-    Optimized ULAttention:
-    - Channel: ECA-style 1D conv on pooled descriptor.
-    - Spatial: avg+max concat -> small conv (3x3) producing single-channel map.
-    - Fusion: learnable softmax fusion with temperature.
-    - Residual-style output ensures compatibility with DWConv and Full.
+    Upgraded ULAttention (ULA++) for improved channel and spatial attention.
+    - Channel: ECA1D + lightweight 1x1 Conv projection on descriptor.
+    - Spatial: avg+max concat -> depthwise separable conv (3x3 DW + 1x1 PW).
+    - Fusion: dynamic gate from input features replaces fixed softmax weights.
+    - Residual output with learnable gamma scaling.
     """
-    def __init__(self, channel, reduction=16):
+    def __init__(self, channel, reduction=16, enable_spatial=True, gamma_init=0.1):
         super().__init__()
         self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.enable_spatial = enable_spatial
 
-        # Channel attention: ECA 1D conv
-        gamma = 2
-        b = 1
-        t = int(abs((math.log2(max(1, channel)) * gamma + b)))
-        k = t if (t % 2 == 1 and t >= 1) else max(3, t + 1)
-        k = min(k, channel) if channel > 1 else 3
+        # safe adaptive ECA kernel
+        k = _eca_kernel_size(channel, gamma=2, b=1)
         self.eca_conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
+        self.channel_proj = nn.Conv1d(1, 1, kernel_size=1, bias=True)
 
-        # Spatial attention: avg+max -> conv3x3
-        self.sa_conv = nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False)
-        # Learnable fusion weights and temperature (slightly favor channel branch)
-        self.fuse = nn.Parameter(torch.tensor([0.7, 0.3], dtype=torch.float32))
-        self.log_tau = nn.Parameter(torch.tensor(math.log(0.25), dtype=torch.float32))
+        # learnable residual scaling for attention output (smaller init for stability)
+        self.gamma = nn.Parameter(torch.tensor(gamma_init, dtype=torch.float32))
+
+        # Spatial attention: avg+max -> depthwise separable conv (3x3 DW + 1x1 PW)
+        if self.enable_spatial:
+            self.sa_dw = nn.Conv2d(2, 2, 3, padding=1, groups=2, bias=False)
+            self.sa_pw = nn.Conv2d(2, 1, 1, bias=False)
+        else:
+            self.sa_dw = None
+            self.sa_pw = None
+
+        # Dynamic fusion gate replacing fixed softmax fusion weights
+        self.fuse_gate = nn.Sequential(
+            nn.Conv2d(channel, 2, 1, bias=True),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
         b, c, h, w = x.size()
@@ -77,19 +107,27 @@ class ULAttention(nn.Module):
         y = self.global_pool(x).view(b, c)
         y = y.unsqueeze(1)  # (B,1,C)
         y = self.eca_conv(y)
+        y = self.channel_proj(y)
         ca_map = torch.sigmoid(y).view(b, c, 1, 1).expand_as(x)
 
-        # Spatial branch
-        avg = torch.mean(x, dim=1, keepdim=True)
-        mx, _ = torch.max(x, dim=1, keepdim=True)
-        sa_map = torch.sigmoid(self.sa_conv(torch.cat([avg, mx], dim=1))).expand_as(x)
+        # Spatial branch (optional)
+        if self.enable_spatial:
+            avg = torch.mean(x, dim=1, keepdim=True)
+            mx, _ = torch.max(x, dim=1, keepdim=True)
+            sa_map = torch.sigmoid(self.sa_pw(self.sa_dw(torch.cat([avg, mx], dim=1)))).expand_as(x)
+        else:
+            sa_map = 0.0
 
-        # Fusion
-        # Clamp temperature for stability
-        tau = torch.clamp(torch.exp(self.log_tau), min=0.05, max=1.0)
-        w = torch.softmax(self.fuse / tau, dim=0)
-        out = x * (w[0] * ca_map + w[1] * sa_map)
-        return x + out
+        # Dynamic fusion gate
+        gate = self.fuse_gate(x.mean(dim=(2,3), keepdim=True))
+        out = x * (gate[:,0:1] * ca_map + (gate[:,1:2] * sa_map if isinstance(sa_map, torch.Tensor) else 0.0))
+
+        # return attention-enhanced features (scaled). Outer block composes residuals.
+        return self.gamma * out
+
+
+# Keep old ULAttention name for compatibility
+ULAttention = ULAttentionPlus
 
 
 # NOTE: StageULAttention merged into GADWResidualBlock to simplify module hierarchy
@@ -103,7 +141,9 @@ class GADWResidualBlock(nn.Module):
     block input.
     """
     def __init__(self, channels, kernel_size=3, res_scale=0.1,
-                 use_dwconv=True, idx=0, use_attention=True):
+                 use_dwconv=True, idx=0, use_attention=True,
+                 depth_ratio=1.0, depth_power=1.5, act='prelu',
+                 att_alpha_init=0.1, att_gamma_init=0.1, att_spatial=True):
         super().__init__()
         self.use_dwconv = use_dwconv
         self.use_attention = use_attention
@@ -120,22 +160,28 @@ class GADWResidualBlock(nn.Module):
             self.pw1 = None
             self.pw2 = None
 
-        # lightweight activation
-        self.act = nn.ReLU6(inplace=True)
+        # lightweight activation (configurable)
+        if act == 'prelu':
+            self.act = nn.PReLU(num_parameters=channels)
+        elif act == 'silu':
+            self.act = nn.SiLU(inplace=True)
+        else:
+            self.act = nn.ReLU(inplace=True)
 
         # learnable residual scaling
         self.res_scale = nn.Parameter(torch.tensor(res_scale, dtype=torch.float32))
 
-        # Integrate StageULAttention functionality here: 1x1 proj -> ULAttention -> 1x1 proj
+        # depth-aware gate: (i/B)^p in [0,1]
+        self.register_buffer('depth_gate', torch.tensor(float(max(1e-6, depth_ratio)) ** float(depth_power)))
+
+        # Integrate StageULAttention functionality here
         if self.use_attention:
-            # small bottleneck/projections to keep overhead minimal
             self.proj_in = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-            self.att = ULAttention(channels, reduction=8)
+            self.att = ULAttentionPlus(channels, reduction=8, enable_spatial=att_spatial, gamma_init=att_gamma_init)
             self.proj_out = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-            # learnable scalar to control magnitude of the attention residual
-            self.alpha = nn.Parameter(torch.tensor(0.2, dtype=torch.float32))
+            # smaller init alpha for stability
+            self.alpha = nn.Parameter(torch.tensor(att_alpha_init, dtype=torch.float32))
         else:
-            # placeholders to avoid attribute errors when attention disabled
             self.proj_in = None
             self.att = None
             self.proj_out = None
@@ -154,12 +200,12 @@ class GADWResidualBlock(nn.Module):
 
         if self.use_attention and self.att is not None:
             y_in = self.proj_in(out)
-            y_att = self.att(y_in)
-            # 在投影前对齐坐标系做差分增量
+            # depth-gated attention response
+            y_att = self.att(y_in) * self.depth_gate
             delta = y_att - y_in
             y = self.proj_out(delta)
-            # 保留主干残差 out，再叠加注意力带来的增量
-            return x + out + self.alpha * y
+            scaled_alpha = self.alpha * self.depth_gate
+            return x + out + scaled_alpha * y
         else:
             return x + out
 
@@ -183,12 +229,28 @@ class ULRNet(nn.Module):
         use_dw = getattr(args, 'use_dwconv', True)
         use_att = getattr(args, 'use_attention', True)
 
+        # new knobs (read via getattr, keep defaults safe)
+        att_start_ratio = float(getattr(args, 'att_start_ratio', 0.67))  # only last ~1/3 enable attention
+        att_depth_power = float(getattr(args, 'att_depth_power', 1.5))
+        att_alpha_init = float(getattr(args, 'att_alpha_init', 0.1))
+        att_gamma_init = float(getattr(args, 'att_gamma_init', 0.1))
+        att_spatial = bool(getattr(args, 'att_spatial', True))
+        act_type = str(getattr(args, 'act', 'prelu'))
+
         m_body = []
         total_blocks = n_resblocks
+        start_idx = int(total_blocks * att_start_ratio)
         for i in range(n_resblocks):
             use_dw_block = use_dw
-            block = GADWResidualBlock(n_feats, kernel_size=3, res_scale=0.1,
-                                           use_dwconv=use_dw_block, idx=i, use_attention=use_att)
+            # enable attention only in the last K% blocks
+            use_att_block = use_att and (i >= start_idx)
+            depth_ratio = (i + 1) / float(total_blocks)
+            block = GADWResidualBlock(
+                n_feats, kernel_size=3, res_scale=0.1,
+                use_dwconv=use_dw_block, idx=i, use_attention=use_att_block,
+                depth_ratio=depth_ratio, depth_power=att_depth_power, act=act_type,
+                att_alpha_init=att_alpha_init, att_gamma_init=att_gamma_init, att_spatial=att_spatial
+            )
             block.total_blocks = total_blocks
             m_body.append(block)
         m_body.append(conv(n_feats, n_feats, 3))
