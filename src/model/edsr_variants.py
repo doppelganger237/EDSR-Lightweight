@@ -230,7 +230,7 @@ class ULRNet(nn.Module):
         use_att = getattr(args, 'use_attention', True)
 
         # new knobs (read via getattr, keep defaults safe)
-        att_start_ratio = float(getattr(args, 'att_start_ratio', 0.67))  # only last ~1/3 enable attention
+        att_start_ratio = float(getattr(args, 'att_start_ratio', 0.5))  # only last ~1/3 enable attention
         att_depth_power = float(getattr(args, 'att_depth_power', 1.5))
         att_alpha_init = float(getattr(args, 'att_alpha_init', 0.1))
         att_gamma_init = float(getattr(args, 'att_gamma_init', 0.1))
