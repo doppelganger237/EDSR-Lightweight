@@ -42,51 +42,46 @@ class GADWConvLite(nn.Module):
 
 class ULAttention(nn.Module):
     """
-    ULAttention (改良融合版)
-    - Channel: ECA-style 1D conv on pooled descriptor (very low parameter cost).
-    - Spatial: avg+max concat -> small conv (3x3) producing a single-channel map.
-    - Fusion: learnable temperature-softmax weights to combine CA and SA maps.
-    - Returns x + out (residual-style) so it can be used block-level or stage-level.
+    Optimized ULAttention:
+    - Channel: ECA-style 1D conv on pooled descriptor.
+    - Spatial: avg+max concat -> small conv (3x3) producing single-channel map.
+    - Fusion: learnable softmax fusion with temperature.
+    - Residual-style output ensures compatibility with DWConv and Full.
     """
     def __init__(self, channel, reduction=16):
         super().__init__()
         self.global_pool = nn.AdaptiveAvgPool2d(1)
 
-        # ECA-style 1D conv kernel selection (small odd kernel)
+        # Channel attention: ECA 1D conv
         gamma = 2
         b = 1
         t = int(abs((math.log2(max(1, channel)) * gamma + b)))
         k = t if (t % 2 == 1 and t >= 1) else max(3, t + 1)
-        # ensure kernel not larger than channel
         k = min(k, channel) if channel > 1 else 3
         self.eca_conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
 
-        # Spatial attention: avg + max -> small conv (2 -> 1)
+        # Spatial attention: avg+max -> conv3x3
         self.sa_conv = nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False)
 
-        # learnable fusion weights and temperature
+        # Learnable fusion weights and temperature
         self.fuse = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
-        # log temperature: initial value for tau ~0.3
         self.log_tau = nn.Parameter(torch.tensor(math.log(0.3), dtype=torch.float32))
 
     def forward(self, x):
         b, c, h, w = x.size()
 
-        # Channel branch (ECA)
-        y = self.global_pool(x).view(b, c)       # (B, C)
-        y = y.unsqueeze(1)                       # (B, 1, C)
-        y = self.eca_conv(y)                     # (B, 1, C)
-        ca = torch.sigmoid(y).view(b, c, 1, 1)   # (B, C, 1, 1)
-        ca_map = ca.expand_as(x)
+        # Channel branch
+        y = self.global_pool(x).view(b, c)
+        y = y.unsqueeze(1)  # (B,1,C)
+        y = self.eca_conv(y)
+        ca_map = torch.sigmoid(y).view(b, c, 1, 1).expand_as(x)
 
         # Spatial branch
         avg = torch.mean(x, dim=1, keepdim=True)
         mx, _ = torch.max(x, dim=1, keepdim=True)
-        sa_in = torch.cat([avg, mx], dim=1)     # (B,2,H,W)
-        sa = torch.sigmoid(self.sa_conv(sa_in)) # (B,1,H,W)
-        sa_map = sa.expand(b, c, h, w)
+        sa_map = torch.sigmoid(self.sa_conv(torch.cat([avg, mx], dim=1))).expand_as(x)
 
-        # Fusion with temperature
+        # Fusion
         tau = torch.exp(self.log_tau) + 1e-6
         w = torch.softmax(self.fuse / tau, dim=0)
         out = x * (w[0] * ca_map + w[1] * sa_map)

@@ -143,8 +143,6 @@ parser.add_argument('--save_results', action='store_true',
 parser.add_argument('--save_gt', action='store_true',
                     help='save low-resolution and high-resolution images together')
 
-parser.add_argument('--only_y', action='store_true',
-                    help='compute PSNR/SSIM only on the Y channel')
 
 parser.add_argument('--use_dwconv', action='store_true',
                     help='use depthwise separable convolution in residual blocks')
@@ -153,7 +151,6 @@ parser.add_argument('--use_attention', action='store_true',
 
 parser.add_argument('--att_mode', type=str, default='dila+stage+esa', help='Comma or plus separated attention modes')
 
-parser.add_argument('--amp', action='store_true', help='use automatic mixed precision training')
 
 args = parser.parse_args()
 template.set_template(args)
