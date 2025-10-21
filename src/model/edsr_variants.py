@@ -74,7 +74,7 @@ class ULAttentionPlus(nn.Module):
     - Fusion: dynamic gate from input features replaces fixed softmax weights.
     - Residual output with learnable gamma scaling.
     """
-    def __init__(self, channel, reduction=16, enable_spatial=True, gamma_init=0.1):
+    def __init__(self, channel, reduction=16, enable_spatial=True, gamma_init=0.1, alpha=0.1, expand=1):
         super().__init__()
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.enable_spatial = enable_spatial
@@ -86,6 +86,9 @@ class ULAttentionPlus(nn.Module):
 
         # learnable residual scaling for attention output (smaller init for stability)
         self.gamma = nn.Parameter(torch.tensor(gamma_init, dtype=torch.float32))
+        # Optionally allow alpha parameter (not used in this class, but for block)
+        self.alpha = alpha
+        self.expand = expand
 
         # Spatial attention: avg+max -> depthwise separable conv (3x3 DW + 1x1 PW)
         if self.enable_spatial:
@@ -127,7 +130,7 @@ class ULAttentionPlus(nn.Module):
         out = x * (gate[:,0:1] * ca_map + (gate[:,1:2] * sa_map if isinstance(sa_map, torch.Tensor) else 0.0))
 
         # return attention-enhanced features (scaled). Outer block composes residuals.
-        gamma = torch.clamp(self.gamma, 0.0, 2.0)
+        gamma = torch.sigmoid(self.gamma) * 3.0
         return gamma * out
 
 
@@ -148,24 +151,35 @@ class GADWResidualBlock(nn.Module):
     def __init__(self, channels, kernel_size=3, res_scale=0.1,
                  use_dwconv=True, idx=0, use_attention=True,
                  depth_ratio=1.0, depth_power=1.5, act='prelu',
-                 att_alpha_init=0.1, att_gamma_init=0.1, att_spatial=True):
+                 att_alpha_init=0.1, att_gamma_init=0.1, att_spatial=True,
+                 expand=1, full_mode=False):
         super().__init__()
         self.use_dwconv = use_dwconv
         self.use_attention = use_attention
+        self.expand = int(max(1, expand))
+        self.full_mode = full_mode
         padding = kernel_size // 2
 
         if use_dwconv:
-            self.conv1 = GADWConvLite(channels)
-            self.pw1 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-            self.conv2 = GADWConvLite(channels)
-            self.pw2 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+            if self.expand > 1:
+                exp_ch = channels * self.expand
+                self.pw_exp1 = nn.Conv2d(channels, exp_ch, 1, bias=True)
+                self.dw_e1   = GADWConvLite(exp_ch)
+                self.pw_red1 = nn.Conv2d(exp_ch, channels, 1, bias=True)
+
+                self.pw_exp2 = nn.Conv2d(channels, exp_ch, 1, bias=True)
+                self.dw_e2   = GADWConvLite(exp_ch)
+                self.pw_red2 = nn.Conv2d(exp_ch, channels, 1, bias=True)
+            else:
+                self.conv1 = GADWConvLite(channels)
+                self.pw1   = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+                self.conv2 = GADWConvLite(channels)
+                self.pw2   = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
         else:
             self.conv1 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
             self.conv2 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
-            self.pw1 = None
-            self.pw2 = None
+            self.pw1 = self.pw2 = None
 
-        # lightweight activation (configurable)
         if act == 'prelu':
             self.act = nn.PReLU(num_parameters=channels)
         elif act == 'silu':
@@ -173,45 +187,96 @@ class GADWResidualBlock(nn.Module):
         else:
             self.act = nn.ReLU(inplace=True)
 
-        # learnable residual scaling
-        self.res_scale = nn.Parameter(torch.tensor(res_scale, dtype=torch.float32))
-
-        # depth-aware gate: (i/B)^p in [0,1]
+        # Patch: set res_scale to 0.12 if use_attention else 0.1
+        if self.use_attention:
+            # full_mode时res_scale=0.12
+            if self.full_mode:
+                res_scale_value = 0.12
+            else:
+                res_scale_value = 0.12
+        else:
+            res_scale_value = 0.1
+        self.res_scale = nn.Parameter(torch.tensor(res_scale_value, dtype=torch.float32))
         self.register_buffer('depth_gate', torch.tensor(float(max(1e-6, depth_ratio)) ** float(depth_power)))
 
-        # Integrate StageULAttention functionality here
         if self.use_attention:
-            self.proj_in = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-            self.att = ULAttentionPlus(channels, reduction=8, enable_spatial=att_spatial, gamma_init=att_gamma_init)
-            self.proj_out = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-            # smaller init alpha for stability
-            self.alpha = nn.Parameter(torch.tensor(att_alpha_init, dtype=torch.float32))
+            # full_mode时ULAttention参数特殊
+            if self.full_mode:
+                att_alpha = 0.15
+                att_gamma = 0.2
+                att_expand = 2
+                att_enable_spatial = True
+            else:
+                att_alpha = att_alpha_init
+                att_gamma = att_gamma_init
+                att_expand = self.expand
+                att_enable_spatial = att_spatial
+            self.proj_in  = nn.Conv2d(channels, channels * att_expand, kernel_size=1, bias=True)
+            self.att      = ULAttentionPlus(
+                channels * att_expand, reduction=8,
+                enable_spatial=att_enable_spatial,
+                gamma_init=att_gamma,
+                alpha=att_alpha,
+                expand=att_expand
+            )
+            self.proj_out = nn.Conv2d(channels * att_expand, channels, kernel_size=1, bias=True)
+            self.alpha    = nn.Parameter(torch.tensor(att_alpha, dtype=torch.float32))
         else:
-            self.proj_in = None
-            self.att = None
-            self.proj_out = None
-            self.alpha = None
+            self.proj_in = self.att = self.proj_out = self.alpha = None
 
     def forward(self, x):
-        out = self.conv1(x)
-        if self.use_dwconv and self.pw1 is not None:
-            out = self.pw1(out)
-        out = self.act(out)
-        out = self.conv2(out)
-        if self.use_dwconv and self.pw2 is not None:
-            out = self.pw2(out)
+        if self.use_dwconv and self.expand > 1:
+            out = self.pw_exp1(x)
+            out = self.act(self.dw_e1(out))
+            out = self.pw_red1(out)
+            out = self.act(out)
+            out = self.pw_exp2(out)
+            out = self.act(self.dw_e2(out))
+            out = self.pw_red2(out)
+        else:
+            out = self.conv1(x)
+            if self.use_dwconv and self.pw1 is not None:
+                out = self.pw1(out)
+            out = self.act(out)
+            out = self.conv2(out)
+            if self.use_dwconv and self.pw2 is not None:
+                out = self.pw2(out)
 
         out = out * self.res_scale
 
         if self.use_attention and self.att is not None:
             y_in = self.proj_in(out)
-            # depth-gated attention response
             y_att = self.att(y_in) * self.depth_gate
             y = self.proj_out(y_att)
             scaled_alpha = self.alpha * self.depth_gate
             return x + out + scaled_alpha * y
         else:
             return x + out
+
+
+# Define a simple fallback GlobalContext if not in common
+class LocalGlobalContext(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv_mask = nn.Conv2d(channels, 1, kernel_size=1)
+        self.softmax = nn.Softmax(dim=2)
+        self.channel_add_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.LayerNorm([channels, 1, 1]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=1)
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        input_x = x
+        mask = self.conv_mask(x).view(b, 1, -1)
+        mask = self.softmax(mask)
+        x = x.view(b, c, -1)
+        context = torch.bmm(x, mask.permute(0, 2, 1))
+        context = context.view(b, c, 1, 1)
+        channel_add_term = self.channel_add_conv(context)
+        return input_x + channel_add_term
 
 
 class ULRNet(nn.Module):
@@ -230,8 +295,12 @@ class ULRNet(nn.Module):
             nn.PReLU(num_parameters=n_feats),
         ]
 
-        use_dw = getattr(args, 'use_dwconv', True)
-        use_att = getattr(args, 'use_attention', True)
+        # Change default values here; keep use_dwconv/use_attention defaults as False
+        use_dw = getattr(args, 'use_dwconv', False)
+        use_att = getattr(args, 'use_attention', False)
+
+        # full_mode: 如果 use_dwconv 和 use_attention 同时为 True，则自动开启 full_mode
+        full_mode = use_dw and use_att
 
         # new knobs (read via getattr, keep defaults safe)
         att_start_ratio = float(getattr(args, 'att_start_ratio', 0.67))  # only last ~1/3 enable attention
@@ -241,19 +310,58 @@ class ULRNet(nn.Module):
         att_spatial = bool(getattr(args, 'att_spatial', False))
         act_type = str(getattr(args, 'act', 'prelu'))
 
+        # full模式: 启用注意力前50%，ULAttention alpha=0.15, gamma=0.2, expand=2，sa开启
+        # att-only模式轻量化增强: sa开启，alpha/gamma=0.12，expand=1
+        if full_mode:
+            att_start_ratio_local = 0.5
+            att_depth_power_local = min(att_depth_power, 1.6)
+            att_alpha_init_local  = 0.15
+            att_gamma_init_local  = 0.2
+            att_spatial_local     = True
+            expand_local          = 2
+        elif use_att and not use_dw:
+            # att-only模式轻量化增强
+            att_start_ratio_local = min(att_start_ratio, 0.5)
+            att_depth_power_local = att_depth_power
+            att_alpha_init_local  = 0.12
+            att_gamma_init_local  = 0.12
+            att_spatial_local     = True
+            expand_local          = 1
+        else:
+            att_start_ratio_local = att_start_ratio
+            att_depth_power_local = att_depth_power
+            att_alpha_init_local  = att_alpha_init
+            att_gamma_init_local  = att_gamma_init
+            att_spatial_local     = att_spatial
+            expand_local          = 1
+
         m_body = []
         total_blocks = n_resblocks
-        start_idx = int(total_blocks * att_start_ratio)
+        if full_mode:
+            # full模式: 后半段残差块启用注意力
+            att_enable_blocks = total_blocks // 2
+        else:
+            att_enable_blocks = int(total_blocks * att_start_ratio_local)
         for i in range(n_resblocks):
             use_dw_block = use_dw
-            # enable attention only in the last K% blocks
-            use_att_block = use_att and (i >= start_idx)
+            if full_mode:
+                # full模式: 后半段残差块启用注意力
+                use_att_block = (i >= total_blocks // 2)
+                expand_block = 2
+                full_mode_block = True
+            else:
+                # 非full模式: 仅在后K%启用注意力
+                use_att_block = use_att and (i >= att_enable_blocks)
+                expand_block = expand_local
+                full_mode_block = False
             depth_ratio = (i + 1) / float(total_blocks)
             block = GADWResidualBlock(
                 n_feats, kernel_size=3, res_scale=0.1,
                 use_dwconv=use_dw_block, idx=i, use_attention=use_att_block,
-                depth_ratio=depth_ratio, depth_power=att_depth_power, act=act_type,
-                att_alpha_init=att_alpha_init, att_gamma_init=att_gamma_init, att_spatial=att_spatial
+                depth_ratio=depth_ratio, depth_power=att_depth_power_local, act=act_type,
+                att_alpha_init=att_alpha_init_local, att_gamma_init=att_gamma_init_local, att_spatial=att_spatial_local,
+                expand=expand_block,
+                full_mode=full_mode_block
             )
             block.total_blocks = total_blocks
             m_body.append(block)
@@ -262,8 +370,22 @@ class ULRNet(nn.Module):
         self.head = nn.Sequential(*m_head)
         self.body = nn.Sequential(*m_body)
 
+        # full模式下使用GC模块
+        if full_mode:
+            try:
+                from model.common import GlobalContext
+                self.gc = GlobalContext(n_feats)
+            except ImportError:
+                self.gc = LocalGlobalContext(n_feats)
+        else:
+            self.gc = None
+        # Add learnable gc_scale if gc is used
+        if self.gc is not None:
+            self.gc_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+
         # Remove global_att usage, keep None
         self.global_att = None
+        self.full_mode = full_mode
 
         m_tail = [
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
@@ -286,7 +408,12 @@ class ULRNet(nn.Module):
             out = block(out)
         res = last_conv(out)
 
-        # self.global_att is None, so skip attention here
+        # full_mode下GC输出加到residual，增加gc_scale参数
+        if self.full_mode and self.gc is not None:
+            gc_out = self.gc(out)
+            gc_gate = torch.sigmoid(self.gc_scale)
+            res = res + gc_gate * gc_out
+
         res = res + x
         x = self.tail(res)
         x = self.add_mean(x)

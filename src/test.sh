@@ -11,8 +11,13 @@
 #python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96  --save sr_dwconv --epochs 300 --n_threads 1 --use_dwconv --save_results
 
 # 训练 Attention only
-python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96  --save sr_att --n_threads 1 --use_attention --save_results
+#python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96  --save sr_att --n_threads 1 --use_attention --save_results
 
+# 训练 DW
+#python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96  --save sr_dwconv --n_threads 1 --use_dwconv --save_results --decay 40-80-120-160-200-240-280 --epochs 300
+
+# 训练 Full
+python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96  --save sr_full --n_threads 1 --use_dwconv --use_attention --decay 40-80-120-160-200-240-280 --epochs 300 --n_feats 80 --n_resblocks 20
 
 # Train Baseline
 #python main.py --model EDSR --scale 2 --save EDSR_Baseline_x2 --epochs 300 --n_threads 0 --save_results
