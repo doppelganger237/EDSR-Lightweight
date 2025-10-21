@@ -29,15 +29,19 @@ class GADWConvLite(nn.Module):
         k = min(k, channels) if channels > 1 else 3
         self.eca_conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
+        # learnable gating strength to avoid over-suppression in early training
+        self.beta = nn.Parameter(torch.tensor(0.2, dtype=torch.float32))
 
     def forward(self, x):
         out = self.dw(x)
-        y = x.mean(dim=(2, 3), keepdim=True)
+        # Use post-conv statistics for ECA to align semantics
+        y = out.mean(dim=(2, 3), keepdim=True)
         y = y.squeeze(-1).permute(0, 2, 1)
         y = self.eca_conv(y)
         y = self.sigmoid(y.permute(0, 2, 1).unsqueeze(-1))
-        out = out * y + x
-        return out
+        # Residual-style gating to control modulation strength
+        out = out + self.beta * (out * y - out)
+        return out + x
 
 
 class ULAttention(nn.Module):
@@ -62,10 +66,9 @@ class ULAttention(nn.Module):
 
         # Spatial attention: avg+max -> conv3x3
         self.sa_conv = nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False)
-
-        # Learnable fusion weights and temperature
-        self.fuse = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
-        self.log_tau = nn.Parameter(torch.tensor(math.log(0.3), dtype=torch.float32))
+        # Learnable fusion weights and temperature (slightly favor channel branch)
+        self.fuse = nn.Parameter(torch.tensor([0.7, 0.3], dtype=torch.float32))
+        self.log_tau = nn.Parameter(torch.tensor(math.log(0.25), dtype=torch.float32))
 
     def forward(self, x):
         b, c, h, w = x.size()
@@ -82,10 +85,10 @@ class ULAttention(nn.Module):
         sa_map = torch.sigmoid(self.sa_conv(torch.cat([avg, mx], dim=1))).expand_as(x)
 
         # Fusion
-        tau = torch.exp(self.log_tau) + 1e-6
+        # Clamp temperature for stability
+        tau = torch.clamp(torch.exp(self.log_tau), min=0.05, max=1.0)
         w = torch.softmax(self.fuse / tau, dim=0)
         out = x * (w[0] * ca_map + w[1] * sa_map)
-
         return x + out
 
 
@@ -108,10 +111,14 @@ class GADWResidualBlock(nn.Module):
 
         if use_dwconv:
             self.conv1 = GADWConvLite(channels)
+            self.pw1 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
             self.conv2 = GADWConvLite(channels)
+            self.pw2 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
         else:
             self.conv1 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
             self.conv2 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
+            self.pw1 = None
+            self.pw2 = None
 
         # lightweight activation
         self.act = nn.ReLU6(inplace=True)
@@ -126,7 +133,7 @@ class GADWResidualBlock(nn.Module):
             self.att = ULAttention(channels, reduction=8)
             self.proj_out = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
             # learnable scalar to control magnitude of the attention residual
-            self.alpha = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+            self.alpha = nn.Parameter(torch.tensor(0.2, dtype=torch.float32))
         else:
             # placeholders to avoid attribute errors when attention disabled
             self.proj_in = None
@@ -136,16 +143,23 @@ class GADWResidualBlock(nn.Module):
 
     def forward(self, x):
         out = self.conv1(x)
+        if self.use_dwconv and self.pw1 is not None:
+            out = self.pw1(out)
         out = self.act(out)
         out = self.conv2(out)
+        if self.use_dwconv and self.pw2 is not None:
+            out = self.pw2(out)
 
         out = out * self.res_scale
 
         if self.use_attention and self.att is not None:
-            y = self.proj_in(out)
-            y = self.att(y)
-            y = self.proj_out(y)
-            return x + self.alpha * y
+            y_in = self.proj_in(out)
+            y_att = self.att(y_in)
+            # 在投影前对齐坐标系做差分增量
+            delta = y_att - y_in
+            y = self.proj_out(delta)
+            # 保留主干残差 out，再叠加注意力带来的增量
+            return x + out + self.alpha * y
         else:
             return x + out
 
