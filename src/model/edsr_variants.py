@@ -25,105 +25,29 @@ def _safe_eca_k(channels, gamma=2.5, b=1):
 # ---------------- RepConvBlock ----------------
 class RepConvBlock(nn.Module):
     """
-    Training-time multi-branch block (3x3 conv + identity) with BN
-    At inference we can fuse branches to a single conv. Provides strong training capacity,
-    light inference cost after reparam.
+    RepConvBlock: 3x3 conv + identity, no BN, SiLU/PReLU/ReLU.
     """
     def __init__(self, channels, kernel_size=3, act='relu', deploy=False):
         super().__init__()
         self.deploy = deploy
         padding = kernel_size // 2
 
-        if deploy:
-            self.rbr_reparam = nn.Conv2d(channels, channels, kernel_size,
-                                         padding=padding, bias=True)
-        else:
-            # branch 1: kxk conv
-            self.rbr_dense = nn.Sequential(
-                nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=False),
-                nn.BatchNorm2d(channels)
-            )
-            # branch 3: identity (BN)
-            self.rbr_identity = nn.BatchNorm2d(channels)
+        self.rbr_dense = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
+        self.rbr_identity = nn.Identity()
 
         if act == 'prelu':
-            self.act = nn.PReLU(num_parameters=channels)
+            self.act = nn.SiLU(inplace=True)
         elif act == 'silu':
             self.act = nn.SiLU(inplace=True)
         else:
             self.act = nn.ReLU(inplace=True)
-        # early deployment ready: convert_to_deploy() can be called mid-training
 
     def forward(self, x):
-        if self.deploy:
-            out = self.rbr_reparam(x)
-            return self.act(out)
-        out = 0
-        if hasattr(self, 'rbr_dense'):
-            out = out + self.rbr_dense(x)
-        if hasattr(self, 'rbr_identity'):
-            out = out + self.rbr_identity(x)
+        out = self.rbr_dense(x) + self.rbr_identity(x)
         return self.act(out)
 
-    @staticmethod
-    def _fuse_conv_bn(conv, bn):
-        # fuse conv and bn to a new kernel and bias
-        if conv is None:
-            return 0, 0
-        w = conv.weight
-        if conv.bias is None:
-            conv_bias = torch.zeros(w.size(0), device=w.device)
-        else:
-            conv_bias = conv.bias
-        bn_w = bn.weight
-        bn_b = bn.bias
-        running_mean = bn.running_mean
-        running_var = bn.running_var
-        eps = bn.eps
-
-        scale = bn_w / torch.sqrt(running_var + eps)
-        w_fold = w * scale.reshape(-1, 1, 1, 1)
-        b_fold = bn_b + (conv_bias - running_mean) * scale
-        return w_fold, b_fold
-
-    def get_equivalent_kernel_bias(self):
-        # produce fused kernel and bias for all branches
-        # dense branch
-        k_dense, b_dense = 0, 0
-        if hasattr(self, 'rbr_dense'):
-            conv = self.rbr_dense[0]
-            bn = self.rbr_dense[1]
-            k_dense, b_dense = self._fuse_conv_bn(conv, bn)
-        k_id, b_id = 0, 0
-        if hasattr(self, 'rbr_identity'):
-            bn = self.rbr_identity
-            # identity conv kernel is delta: shape (C,C,1,1)
-            c = bn.num_features
-            identity_kernel = torch.zeros((c, c, 1, 1), device=bn.weight.device)
-            for i in range(c):
-                identity_kernel[i, i, 0, 0] = 1.0
-            # we'll recalc simply:
-            # scale = bn.weight / sqrt(running_var+eps)
-            # bias = bn.bias - running_mean*scale
-            scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)
-            k_id = identity_kernel * scale.reshape(-1,1,1,1)
-            b_id = bn.bias - bn.running_mean * scale
-
-        k = k_dense + k_id
-        b = b_dense + b_id
-        return k, b
-
     def convert_to_deploy(self):
-        if self.deploy:
-            return
-        k, b = self.get_equivalent_kernel_bias()
-        self.rbr_reparam = nn.Conv2d(k.size(1), k.size(0), k.size(2), padding=k.size(2)//2, bias=True)
-        self.rbr_reparam.weight.data = k
-        self.rbr_reparam.bias.data = b
-        # delete old branches
-        for attr in ['rbr_dense', 'rbr_identity']:
-            if hasattr(self, attr):
-                delattr(self, attr)
+        # No BN fusion needed, nothing to do
         self.deploy = True
 
 # ---------------- SECA ----------------
@@ -242,7 +166,7 @@ class DIFRBlock(nn.Module):
         self.proj_f = nn.Conv2d(c_d + c_c, channels, 1, bias=False)
         self.proj_f2 = nn.Sequential(
             nn.Conv2d(channels, channels, 1, bias=False),
-            nn.PReLU(num_parameters=channels)
+            nn.SiLU(inplace=True)
         )
 
         self.use_eca = use_eca
@@ -288,17 +212,21 @@ class DIFRBlock(nn.Module):
         y = self.proj_f2(y)
         if self.esa:
             y = self.esa(y) * y
+        # PFSC (Param-Free Spatial Contrast) gate
+        contrast = (y - y.mean([2, 3], keepdim=True)) ** 2
+        gate = torch.sigmoid(F.avg_pool2d(contrast, 3, 1, 1))
+        y = y * gate
         res_scale = self.base_res_scale + torch.tanh(self.res_bias)
         return x + y * res_scale
 
 # ---------------- TailRefine ----------------
 class TailRefine(nn.Module):
-    """A tiny residual refine: DW3x3 -> PW1x1 with PReLU and gated residual."""
+    """A tiny residual refine: DW3x3 -> PW1x1 with SiLU and gated residual."""
     def __init__(self, channels):
         super().__init__()
         self.dw = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=True)
         self.pw = nn.Conv2d(channels, channels, 1, bias=True)
-        self.act = nn.PReLU(num_parameters=channels)
+        self.act = nn.SiLU(inplace=True)
         self.alpha = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
 
     def forward(self, x):
@@ -319,7 +247,7 @@ class DIFRN(nn.Module):
         # head
         self.head = nn.Sequential(
             nn.Conv2d(args.n_colors, n_feats, 3, padding=1, bias=False),
-            nn.PReLU(num_parameters=n_feats)
+            nn.SiLU(inplace=True)
         )
 
         # Cross-Block Feedback gate
@@ -388,7 +316,7 @@ class DIFRN(nn.Module):
         # cross-stage feature fusion (lite)
         self.csff = nn.Sequential(
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
-            nn.PReLU(num_parameters=n_feats),
+            nn.SiLU(inplace=True),
             SECA(n_feats, proj_ratio=0.2)
         )
 
@@ -405,8 +333,14 @@ class DIFRN(nn.Module):
         # Tail Attention module
         self.tail_att = nn.Sequential(
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
-            nn.PReLU(num_parameters=n_feats),
+            nn.SiLU(inplace=True),
             SECA(n_feats, proj_ratio=0.18)
+        )
+        # Add LKA-lite after tail_att
+        self.lka_tail = nn.Sequential(
+            nn.Conv2d(n_feats, n_feats, 7, padding=3, groups=n_feats, bias=True),
+            nn.Conv2d(n_feats, n_feats, 5, padding=2, bias=True),
+            nn.SiLU(inplace=True)
         )
 
         # lightweight pixel attention
@@ -419,12 +353,12 @@ class DIFRN(nn.Module):
         # Multi-stage CSFF modules (lightweight)
         self.csff1 = nn.Sequential(
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
-            nn.PReLU(num_parameters=n_feats),
+            nn.SiLU(inplace=True),
             SECA(n_feats, proj_ratio=0.18)
         )
         self.csff2 = nn.Sequential(
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
-            nn.PReLU(num_parameters=n_feats),
+            nn.SiLU(inplace=True),
             SECA(n_feats, proj_ratio=0.20)
         )
 
@@ -489,6 +423,7 @@ class DIFRN(nn.Module):
 
         res = self.tail_refine(res)
         res = self.tail_att(res)
+        res = self.lka_tail(res)
         res = res * (1 + 0.5 * self.apply_msg(res))
         res = self.pixel_att(res)
         x = self.tail(res)
@@ -496,7 +431,7 @@ class DIFRN(nn.Module):
         return x
 
     def convert_to_deploy(self):
-        # convert all RepConv inside detail branches
+        # convert all RepConv inside detail branches, no BN fusion needed
         for m in self.modules():
             if isinstance(m, DIFRBlock):
                 for subm in m.detail.modules():
