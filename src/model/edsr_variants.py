@@ -126,13 +126,19 @@ class DWASPP(nn.Module):
 
 # ---------------- HybridASPP (DWASPP + pointwise channel interaction) ----------------
 class HybridASPP(nn.Module):
-    def __init__(self, channels, rates=(1,2,3,5)):
+    def __init__(self, channels, rates=(1,2,3,6)):
         super().__init__()
-        self.dw = DWASPP(channels, rates=rates)
-        self.pw = nn.Conv2d(channels, channels, 1, bias=False)
+        # Parallel DWConv 3x3 and 5x5, then concat and project
+        self.dw3 = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False)
+        self.dw5 = nn.Conv2d(channels, channels, 5, padding=2, groups=channels, bias=False)
+        self.project = nn.Conv2d(channels * 2, channels, 1, bias=False)
         self.act = nn.ReLU(inplace=True)
     def forward(self, x):
-        return self.act(self.pw(self.dw(x)))
+        out3 = self.act(self.dw3(x))
+        out5 = self.act(self.dw5(x))
+        out = torch.cat([out3, out5], dim=1)
+        out = self.project(out)
+        return out
 
 # ---------------- DIFRBlock ----------------
 # context branch now uses progressive channel distillation (RFDN-inspired)
@@ -150,17 +156,35 @@ class DIFRBlock(nn.Module):
             RepConvBlock(c_d, act=act)
         )
 
-        # context branch: progressive channel distillation (RFDN-inspired)
+        # context branch: progressive channel distillation (4-stage, slower decay)
         self.context = nn.Sequential(OrderedDict([
             ("c1_r", nn.Conv2d(c_c, c_c, 3, padding=1, groups=c_c, bias=False)),
-            ("c1_act", nn.ReLU(inplace=True)),
+            ("c1_act", nn.SiLU(inplace=True)),
             ("c1_d", nn.Conv2d(c_c, c_c // 2, 1, bias=False)),
+
             ("c2_r", nn.Conv2d(c_c // 2, c_c // 2, 3, padding=1, groups=c_c // 2, bias=False)),
-            ("c2_act", nn.ReLU(inplace=True)),
-            ("c2_d", nn.Conv2d(c_c // 2, c_c // 4, 1, bias=False)),
-            ("fuse", nn.Conv2d(c_c // 4 * 3, c_c, 1, bias=False)),
-            ("fuse_act", nn.ReLU(inplace=True))
+            ("c2_act", nn.SiLU(inplace=True)),
+            ("c2_d", nn.Conv2d(c_c // 2, c_c // 2, 1, bias=False)),
+
+            ("c3_r", nn.Conv2d(c_c // 2, c_c // 2, 3, padding=1, groups=c_c // 2, bias=False)),
+            ("c3_act", nn.SiLU(inplace=True)),
+            ("c3_d", nn.Conv2d(c_c // 2, c_c // 4, 1, bias=False)),
+
+            ("c4_r", nn.Conv2d(c_c // 4, c_c // 4, 3, padding=1, groups=c_c // 4, bias=False)),
+            ("c4_act", nn.SiLU(inplace=True)),
+            ("c4_d", nn.Conv2d(c_c // 4, c_c // 8, 1, bias=False)),
         ]))
+        # Add learnable distillation weights
+        self.alpha1 = nn.Parameter(torch.tensor(1.0))
+        self.alpha2 = nn.Parameter(torch.tensor(1.0))
+        self.alpha3 = nn.Parameter(torch.tensor(1.0))
+        self.alpha4 = nn.Parameter(torch.tensor(1.0))
+        # Add gated DWConv1x1 fusion at the end of context
+        self.fuse = nn.Sequential(
+            nn.Conv2d((c_c // 2) + (c_c // 2) + (c_c // 4) + (c_c // 8), c_c, 1, bias=False, groups=1),
+            nn.Conv2d(c_c, c_c, 1, groups=c_c, bias=True),
+            nn.Sigmoid()
+        )
 
         # fusion conv 1x1
         self.proj_f = nn.Conv2d(c_d + c_c, channels, 1, bias=False)
@@ -187,20 +211,33 @@ class DIFRBlock(nn.Module):
         c_c = c - c_d
         xd = x[:, :c_d, :, :]
         xc = x[:, c_d:, :, :]
-        yd = self.detail(xd)
+        # 引入来自 context 分支的轻反馈
+        if hasattr(self, 'last_context'):
+            yd = self.detail(xd + 0.2 * self.last_context)
+        else:
+            yd = self.detail(xd)
 
         # 判断 context 结构类型
-        if len(self.context) >= 8:
-            # progressive context distillation (Sequential-safe)
+        # context progressive distillation structure
+        if len(self.context) >= 12:
             c1_r, c1_act, c1_d = self.context[0], self.context[1], self.context[2]
             c2_r, c2_act, c2_d = self.context[3], self.context[4], self.context[5]
-            fuse, fuse_act = self.context[6], self.context[7]
+            c3_r, c3_act, c3_d = self.context[6], self.context[7], self.context[8]
+            c4_r, c4_act, c4_d = self.context[9], self.context[10], self.context[11]
 
             r1 = c1_act(c1_r(xc))
-            d1 = c1_d(r1)
-            r2 = c2_act(c2_r(d1))
-            d2 = c2_d(r2)
-            yc = fuse_act(fuse(torch.cat([d1, d2, xc[:, :d1.size(1), :, :]], dim=1)))
+            d1 = self.alpha1 * c1_d(r1)
+            r2 = c2_act(c2_r(r1 - d1))
+            d2 = self.alpha2 * c2_d(r2)
+            r3 = c3_act(c3_r(r2 - d2))
+            d3 = self.alpha3 * c3_d(r3)
+            r4 = c4_act(c4_r(r3 - d3))
+            d4 = self.alpha4 * c4_d(r4)
+            # gated DWConv1x1 fusion
+            yc_fuse_input = torch.cat([d1, d2, d3, d4], dim=1)
+            yc = self.fuse(yc_fuse_input) * yc_fuse_input
+            yc = yc.mean(1, keepdim=True).expand_as(d1)
+            self.last_context = yc.detach()
         else:
             # 非渐进结构（DWASPP或简单Conv）
             yc = self.context(xc)
@@ -221,12 +258,12 @@ class DIFRBlock(nn.Module):
 
 # ---------------- TailRefine ----------------
 class TailRefine(nn.Module):
-    """A tiny residual refine: DW3x3 -> PW1x1 with SiLU and gated residual."""
+    """A tiny residual refine: DW5x5 -> PW1x1 with GELU and gated residual."""
     def __init__(self, channels):
         super().__init__()
-        self.dw = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=True)
+        self.dw = nn.Conv2d(channels, channels, 5, padding=2, groups=channels, bias=True)
         self.pw = nn.Conv2d(channels, channels, 1, bias=True)
-        self.act = nn.SiLU(inplace=True)
+        self.act = nn.GELU()
         self.alpha = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
 
     def forward(self, x):
@@ -312,12 +349,14 @@ class DIFRN(nn.Module):
             body.append(block)
         body.append(conv(n_feats, n_feats, 3, bias=False))
         self.body = nn.Sequential(*body)
+        # Add CLCF (Cross-Layer Context Fusion) after body
+        self.clcf = SECA(n_feats, proj_ratio=0.20)
 
         # cross-stage feature fusion (lite)
         self.csff = nn.Sequential(
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
             nn.SiLU(inplace=True),
-            SECA(n_feats, proj_ratio=0.2)
+            SECA(n_feats, proj_ratio=0.20)
         )
 
         # tail
@@ -330,11 +369,17 @@ class DIFRN(nn.Module):
         # final tiny refine
         self.tail_refine = TailRefine(n_feats)
 
+        # Tail lightweight fusion after TailRefine
+        self.tail_fuse = nn.Sequential(
+            nn.Conv2d(n_feats, n_feats, 1, bias=True),
+            nn.GELU()
+        )
+
         # Tail Attention module
         self.tail_att = nn.Sequential(
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
             nn.SiLU(inplace=True),
-            SECA(n_feats, proj_ratio=0.18)
+            SECA(n_feats, proj_ratio=0.20)
         )
         # Add LKA-lite after tail_att
         self.lka_tail = nn.Sequential(
@@ -354,7 +399,7 @@ class DIFRN(nn.Module):
         self.csff1 = nn.Sequential(
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
             nn.SiLU(inplace=True),
-            SECA(n_feats, proj_ratio=0.18)
+            SECA(n_feats, proj_ratio=0.20)
         )
         self.csff2 = nn.Sequential(
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
@@ -384,7 +429,9 @@ class DIFRN(nn.Module):
         mid2_idx = max(0, total_blocks * 3 // 4 - 1)
 
         feedback = None
-        # iterate with residual grouping (res-in-res)
+        # SSA (Shallow Skip Aggregation): collect first and second block outputs
+        ssa_feats = []
+        ssa_weights = [0.65, 0.35]  # weights for aggregation
         for i, block in enumerate(blocks):
             # record group input at group start
             if (i % self.rg_size) == 0:
@@ -401,6 +448,10 @@ class DIFRN(nn.Module):
             if i == mid2_idx:
                 mid2_feat = out
 
+            # SSA: collect first and second block outputs
+            if i == 0 or i == 1:
+                ssa_feats.append(out)
+
             # group residual add
             if ((i + 1) % self.rg_size) == 0 or (i == total_blocks - 1):
                 out = group_input + out
@@ -412,6 +463,15 @@ class DIFRN(nn.Module):
         res = last(out)
         res = res + h
 
+        # SSA: shallow skip aggregation (加权加至res)
+        if len(ssa_feats) == 2:
+            res = res + ssa_weights[0] * ssa_feats[0] + ssa_weights[1] * ssa_feats[1]
+        elif len(ssa_feats) == 1:
+            res = res + ssa_feats[0]
+
+        # CLCF: cross-layer context fusion
+        res = res + self.clcf(res)
+
         # apply multi-stage csff
         if mid1_feat is not None:
             res = res + self.csff1(mid1_feat)
@@ -422,6 +482,7 @@ class DIFRN(nn.Module):
             res = res + self.csff(mid_feat)
 
         res = self.tail_refine(res)
+        res = self.tail_fuse(res)
         res = self.tail_att(res)
         res = self.lka_tail(res)
         res = res * (1 + 0.5 * self.apply_msg(res))
