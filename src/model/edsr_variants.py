@@ -45,12 +45,12 @@ class GADWConvLite(nn.Module):
         super().__init__()
         padding = kernel_size // 2
         self.dw = nn.Conv2d(channels, channels, kernel_size, padding=padding, groups=channels, bias=True)
-        # adaptive ECA 1D kernel size (safe helper)
-        k = _eca_kernel_size(channels, gamma=2, b=1)
+        # adaptive ECA 1D kernel size (safe helper) -- gamma changed to 1.5
+        k = _eca_kernel_size(channels, gamma=1.5, b=1)
         self.eca_conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
-        # learnable gating strength to avoid over-suppression in early training
-        self.beta = nn.Parameter(torch.tensor(0.2, dtype=torch.float32))
+        # learnable gating strength to avoid over-suppression in early training (init changed to 0.15)
+        self.beta = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
 
     def forward(self, x):
         out = self.dw(x)
@@ -152,44 +152,48 @@ class GADWResidualBlock(nn.Module):
                  use_dwconv=True, idx=0, use_attention=True,
                  depth_ratio=1.0, depth_power=1.5, act='prelu',
                  att_alpha_init=0.1, att_gamma_init=0.1, att_spatial=True,
-                 expand=1, full_mode=False):
+                 expand=1, full_mode=False,
+                 pw_groups=1, att_proj_ratio=0.5, shared_prelu=False):
         super().__init__()
         self.use_dwconv = use_dwconv
         self.use_attention = use_attention
         self.expand = int(max(1, expand))
         self.full_mode = full_mode
+        self.pw_groups = max(1, int(pw_groups))
+        self.att_proj_ratio = float(att_proj_ratio)
+        self.shared_prelu = bool(shared_prelu)
         padding = kernel_size // 2
 
         if use_dwconv:
             if self.expand > 1:
                 exp_ch = channels * self.expand
-                self.pw_exp1 = nn.Conv2d(channels, exp_ch, 1, bias=True)
+                self.pw_exp1 = nn.Conv2d(channels, exp_ch, 1, bias=True, groups=self.pw_groups)
                 self.dw_e1   = GADWConvLite(exp_ch)
-                self.pw_red1 = nn.Conv2d(exp_ch, channels, 1, bias=True)
+                self.pw_red1 = nn.Conv2d(exp_ch, channels, 1, bias=True, groups=self.pw_groups)
 
-                self.pw_exp2 = nn.Conv2d(channels, exp_ch, 1, bias=True)
+                self.pw_exp2 = nn.Conv2d(channels, exp_ch, 1, bias=True, groups=self.pw_groups)
                 self.dw_e2   = GADWConvLite(exp_ch)
-                self.pw_red2 = nn.Conv2d(exp_ch, channels, 1, bias=True)
+                self.pw_red2 = nn.Conv2d(exp_ch, channels, 1, bias=True, groups=self.pw_groups)
             else:
                 self.conv1 = GADWConvLite(channels)
-                self.pw1   = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+                self.pw1   = nn.Conv2d(channels, channels, kernel_size=1, bias=True, groups=self.pw_groups)
                 self.conv2 = GADWConvLite(channels)
-                self.pw2   = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+                self.pw2   = nn.Conv2d(channels, channels, kernel_size=1, bias=True, groups=self.pw_groups)
         else:
             self.conv1 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
             self.conv2 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
             self.pw1 = self.pw2 = None
 
         if act == 'prelu':
-            self.act = nn.PReLU(num_parameters=channels)
+            # 共享参数版进一步降参（可通过 shared_prelu 控制）
+            self.act = nn.PReLU(num_parameters=(1 if self.shared_prelu else channels))
         elif act == 'silu':
             self.act = nn.SiLU(inplace=True)
         else:
             self.act = nn.ReLU(inplace=True)
 
-        # Patch: set res_scale to 0.12 if use_attention else 0.1
+        # Patch: set res_scale to 0.12 when attention is used (full/att-only), else 0.1
         if self.use_attention:
-            # full_mode时res_scale=0.12
             if self.full_mode:
                 res_scale_value = 0.12
             else:
@@ -202,24 +206,29 @@ class GADWResidualBlock(nn.Module):
         if self.use_attention:
             # full_mode时ULAttention参数特殊
             if self.full_mode:
-                att_alpha = 0.15
-                att_gamma = 0.2
-                att_expand = 2
+                att_alpha = 0.12
+                att_gamma = 0.15
+                att_expand = 1
                 att_enable_spatial = True
+                # 使用可配置的投影比例，full 模式上限 0.25 保持轻量
+                proj_ratio = min(self.att_proj_ratio, 0.25)
+                att_proj_channels = max(1, int(channels * att_expand * proj_ratio))
             else:
                 att_alpha = att_alpha_init
                 att_gamma = att_gamma_init
                 att_expand = self.expand
                 att_enable_spatial = att_spatial
-            self.proj_in  = nn.Conv2d(channels, channels * att_expand, kernel_size=1, bias=True)
+                proj_ratio = max(0.0625, min(self.att_proj_ratio, 1.0))
+                att_proj_channels = max(1, int(channels * att_expand * proj_ratio))
+            self.proj_in  = nn.Conv2d(channels, att_proj_channels, kernel_size=1, bias=True)
             self.att      = ULAttentionPlus(
-                channels * att_expand, reduction=8,
+                att_proj_channels, reduction=8,
                 enable_spatial=att_enable_spatial,
                 gamma_init=att_gamma,
                 alpha=att_alpha,
                 expand=att_expand
             )
-            self.proj_out = nn.Conv2d(channels * att_expand, channels, kernel_size=1, bias=True)
+            self.proj_out = nn.Conv2d(att_proj_channels, channels, kernel_size=1, bias=True)
             self.alpha    = nn.Parameter(torch.tensor(att_alpha, dtype=torch.float32))
         else:
             self.proj_in = self.att = self.proj_out = self.alpha = None
@@ -282,16 +291,20 @@ class LocalGlobalContext(nn.Module):
 class ULRNet(nn.Module):
     def __init__(self, args, conv=common.default_conv):
         super().__init__()
+        # --- Width scaling and grouped pointwise ---
+        width_mult = 0.75  # 全局宽度缩放系数（固定常量，不引入新选项）
+        pw_groups = 1      # 提升表达力：取消 1x1 分组，提升 PSNR，同时仍然控制总参
+        att_proj_ratio = 0.5  # 放宽注意力投影，减少信息瓶颈
         n_resblocks = args.n_resblocks
-        n_feats = args.n_feats
+        n_feats = int(args.n_feats * width_mult)
         scale = args.scale[0] if isinstance(args.scale, (list, tuple)) else args.scale
 
         self.sub_mean = common.MeanShift(args.rgb_range)
         self.add_mean = common.MeanShift(args.rgb_range, sign=1)
 
+        # 标准更稳的 head：3x3 + PReLU（不做瓶颈）
         m_head = [
             nn.Conv2d(args.n_colors, n_feats, 3, padding=1, bias=True),
-            nn.Conv2d(n_feats, n_feats, 1, bias=True),
             nn.PReLU(num_parameters=n_feats),
         ]
 
@@ -310,15 +323,19 @@ class ULRNet(nn.Module):
         att_spatial = bool(getattr(args, 'att_spatial', False))
         act_type = str(getattr(args, 'act', 'prelu'))
 
-        # full模式: 启用注意力前50%，ULAttention alpha=0.15, gamma=0.2, expand=2，sa开启
-        # att-only模式轻量化增强: sa开启，alpha/gamma=0.12，expand=1
+        # full模式: 轻量增强版 full 模型
+        # - att_expand=1
+        # - att_alpha_init=0.12
+        # - att_gamma_init=0.15
+        # - att_spatial_local=True
+        # - full_mode 启用GC模块与soft gate
         if full_mode:
-            att_start_ratio_local = 0.5
+            att_start_ratio_local = 0.6  # fewer attention blocks
             att_depth_power_local = min(att_depth_power, 1.6)
-            att_alpha_init_local  = 0.15
-            att_gamma_init_local  = 0.2
+            att_alpha_init_local  = 0.12
+            att_gamma_init_local  = 0.15
             att_spatial_local     = True
-            expand_local          = 2
+            expand_local          = 1
         elif use_att and not use_dw:
             # att-only模式轻量化增强
             att_start_ratio_local = min(att_start_ratio, 0.5)
@@ -338,19 +355,20 @@ class ULRNet(nn.Module):
         m_body = []
         total_blocks = n_resblocks
         if full_mode:
-            # full模式: 后半段残差块启用注意力
             att_enable_blocks = total_blocks // 2
         else:
             att_enable_blocks = int(total_blocks * att_start_ratio_local)
+        # 将最后 1/4 的残差块改为标准 3x3 卷积，提升重构质量（其余仍用 DWConv 控参）
+        strong_tail_blocks = max(2, total_blocks // 4)
         for i in range(n_resblocks):
             use_dw_block = use_dw
+            if i >= total_blocks - strong_tail_blocks:
+                use_dw_block = False
             if full_mode:
-                # full模式: 后半段残差块启用注意力
                 use_att_block = (i >= total_blocks // 2)
-                expand_block = 2
+                expand_block = 1
                 full_mode_block = True
             else:
-                # 非full模式: 仅在后K%启用注意力
                 use_att_block = use_att and (i >= att_enable_blocks)
                 expand_block = expand_local
                 full_mode_block = False
@@ -361,7 +379,9 @@ class ULRNet(nn.Module):
                 depth_ratio=depth_ratio, depth_power=att_depth_power_local, act=act_type,
                 att_alpha_init=att_alpha_init_local, att_gamma_init=att_gamma_init_local, att_spatial=att_spatial_local,
                 expand=expand_block,
-                full_mode=full_mode_block
+                full_mode=full_mode_block,
+                pw_groups=pw_groups,
+                att_proj_ratio=att_proj_ratio
             )
             block.total_blocks = total_blocks
             m_body.append(block)
@@ -370,23 +390,21 @@ class ULRNet(nn.Module):
         self.head = nn.Sequential(*m_head)
         self.body = nn.Sequential(*m_body)
 
-        # full模式下使用GC模块
+        # full模式下使用GC模块 (轻量 1x1 bottleneck)
         if full_mode:
-            try:
-                from model.common import GlobalContext
-                self.gc = GlobalContext(n_feats)
-            except ImportError:
-                self.gc = LocalGlobalContext(n_feats)
+            self.gc = nn.Conv2d(n_feats, n_feats // 4, 1, bias=False)
+            self.gc_proj = nn.Conv2d(n_feats // 4, n_feats, 1, bias=False)
         else:
             self.gc = None
-        # Add learnable gc_scale if gc is used
+            self.gc_proj = None
         if self.gc is not None:
-            self.gc_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+            # 更积极的初始门控，帮助 early gain
+            self.gc_scale = nn.Parameter(torch.tensor(0.4, dtype=torch.float32))
 
-        # Remove global_att usage, keep None
         self.global_att = None
         self.full_mode = full_mode
 
+        # 标准更稳的 tail（不做瓶颈），利于 PSNR
         m_tail = [
             nn.Conv2d(n_feats, n_feats, 1, bias=True),
             common.Upsampler(conv, scale, n_feats, act=False),
@@ -411,6 +429,7 @@ class ULRNet(nn.Module):
         # full_mode下GC输出加到residual，增加gc_scale参数
         if self.full_mode and self.gc is not None:
             gc_out = self.gc(out)
+            gc_out = self.gc_proj(gc_out)
             gate = torch.sigmoid(self.gc_scale)  # learnable soft gate
             res = res + gate * gc_out
 
@@ -445,3 +464,11 @@ def check_modules(net):
     has_gadw = any(isinstance(m, GADWConvLite) for m in net.modules())
     has_ulatt = any(isinstance(m, ULAttention) for m in net.modules())
     print(f"[INFO] GADWConvLite: {has_gadw}, ULAttention: {has_ulatt}")
+    # 保留FLOPs和Params打印逻辑
+    import torch
+    from fvcore.nn import FlopCountAnalysis, parameter_count
+    dummy_input = torch.randn(1, 3, 48, 48).to(torch.device("cpu"))  # ⚠️ 必须是 CPU
+    flops = FlopCountAnalysis(net.cpu(), dummy_input)
+    flops.unsupported_ops_warnings(False)
+    params = sum(p.numel() for p in net.parameters())
+    print(f"Params: {params / 1e3:.1f}K , FLOPs: {flops.total() / 1e9:.3f}G")
