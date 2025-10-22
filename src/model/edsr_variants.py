@@ -1,11 +1,15 @@
-# DFDN + RepConv + SparseECA implementation (drop-in for edsr_variants)
+# DIFRN: Dual-Interaction Feature Refinement Network
+# Incorporating RepConv, SECA, ESALite and DW-ASPP for efficient super-resolution
 import math
 import torch
 import torch.nn as nn
 from model import common
 import torch.nn.functional as F
+from collections import OrderedDict
+
 # ---------------- helpers ----------------
-def _safe_eca_k(channels, gamma=2, b=1):
+def _safe_eca_k(channels, gamma=2.5, b=1):
+    # dynamic ECA kernel size: slightly larger for higher channels
     if channels <= 1:
         return 1
     t = int(abs((math.log2(max(1, channels)) * gamma + b)))
@@ -48,6 +52,7 @@ class RepConvBlock(nn.Module):
             self.act = nn.SiLU(inplace=True)
         else:
             self.act = nn.ReLU(inplace=True)
+        # early deployment ready: convert_to_deploy() can be called mid-training
 
     def forward(self, x):
         if self.deploy:
@@ -121,9 +126,9 @@ class RepConvBlock(nn.Module):
                 delattr(self, attr)
         self.deploy = True
 
-# ---------------- SparseECA ----------------
-class SparseECA(nn.Module):
-    """Lightweight ECA but with aggressive projection (sparse) to save params."""
+# ---------------- SECA ----------------
+class SECA(nn.Module):
+    """Lightweight SECA but with aggressive projection (sparse) to save params."""
     def __init__(self, channels, proj_ratio=0.15, gamma=2, b=1):
         super().__init__()
         self.channels = channels
@@ -146,9 +151,69 @@ class SparseECA(nn.Module):
         att = self.sig(y)
         return x * att
 
-# ---------------- DFDBlockLite ----------------
-class DFDBlockLite(nn.Module):
-    def __init__(self, channels, distill_ratio=0.5, proj_ratio=0.15, use_eca=True, res_scale=0.1, act='prelu'):
+# ---------------- ESALite (RFDN-inspired) ----------------
+class ESALite(nn.Module):
+    """
+    Efficient Spatial Attention (lite): reduce -> DW conv stride2 -> conv -> upsample -> sigmoid gate.
+    Lightweight variant using depthwise ops and bilinear upsample. Always bias=True to help small widths.
+    """
+    def __init__(self, channels, reduce=0.5):
+        super().__init__()
+        c_mid = max(8, int(channels * reduce))
+        self.conv1 = nn.Conv2d(channels, c_mid, 1, bias=True)
+        self.conv2 = nn.Conv2d(c_mid, c_mid, 3, stride=2, padding=1, groups=c_mid, bias=True)
+        self.conv3 = nn.Conv2d(c_mid, c_mid, 3, padding=1, bias=True)
+        self.conv4 = nn.Conv2d(c_mid, channels, 1, bias=True)
+        self.act = nn.ReLU(inplace=True)
+        self.sig = nn.Sigmoid()
+
+    def forward(self, x):
+        h, w = x.size(2), x.size(3)
+        y = self.act(self.conv1(x))
+        y = self.act(self.conv2(y))
+        y = self.act(self.conv3(y))
+        y = F.interpolate(y, size=(h, w), mode='bilinear', align_corners=False)
+        y = self.conv4(y)
+        return self.sig(y)
+
+# ---------------- DW-ASPP (lightweight) ----------------
+# ---------------- DW-ASPP (lightweight) ----------------
+class DWASPP(nn.Module):
+    """Depthwise ASPP: parallel depthwise dilated convs with small dilation rates, fuse by 1x1 conv."""
+    def __init__(self, channels, rates=(1,2,3)):
+        super().__init__()
+        self.rates = list(rates)
+        self.dw_convs = nn.ModuleList()
+        for r in self.rates:
+            self.dw_convs.append(
+                nn.Conv2d(channels, channels, 3, padding=r, dilation=r, groups=channels, bias=False)
+            )
+        # fuse
+        self.project = nn.Conv2d(channels * len(self.rates), channels, 1, bias=False)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        outs = []
+        for conv in self.dw_convs:
+            outs.append(self.act(conv(x)))
+        out = torch.cat(outs, dim=1)
+        out = self.project(out)
+        return out
+
+# ---------------- HybridASPP (DWASPP + pointwise channel interaction) ----------------
+class HybridASPP(nn.Module):
+    def __init__(self, channels, rates=(1,2,3,5)):
+        super().__init__()
+        self.dw = DWASPP(channels, rates=rates)
+        self.pw = nn.Conv2d(channels, channels, 1, bias=False)
+        self.act = nn.ReLU(inplace=True)
+    def forward(self, x):
+        return self.act(self.pw(self.dw(x)))
+
+# ---------------- DIFRBlock ----------------
+# context branch now uses progressive channel distillation (RFDN-inspired)
+class DIFRBlock(nn.Module):
+    def __init__(self, channels, distill_ratio=0.5, proj_ratio=0.15, use_eca=True, res_scale=0.1, act='prelu', enable_esa=False):
         super().__init__()
         self.channels = channels
         self.distill_ratio = distill_ratio
@@ -161,23 +226,36 @@ class DFDBlockLite(nn.Module):
             RepConvBlock(c_d, act=act)
         )
 
-        # context branch: depthwise conv (3x3, groups=c_c) -> 1x1 conv -> ReLU
-        self.context = nn.Sequential(
-            nn.Conv2d(c_c, c_c, 3, padding=1, groups=c_c, bias=False),
-            nn.Conv2d(c_c, c_c, 1, bias=False),
-            nn.ReLU(inplace=True)
-        )
+        # context branch: progressive channel distillation (RFDN-inspired)
+        self.context = nn.Sequential(OrderedDict([
+            ("c1_r", nn.Conv2d(c_c, c_c, 3, padding=1, groups=c_c, bias=False)),
+            ("c1_act", nn.ReLU(inplace=True)),
+            ("c1_d", nn.Conv2d(c_c, c_c // 2, 1, bias=False)),
+            ("c2_r", nn.Conv2d(c_c // 2, c_c // 2, 3, padding=1, groups=c_c // 2, bias=False)),
+            ("c2_act", nn.ReLU(inplace=True)),
+            ("c2_d", nn.Conv2d(c_c // 2, c_c // 4, 1, bias=False)),
+            ("fuse", nn.Conv2d(c_c // 4 * 3, c_c, 1, bias=False)),
+            ("fuse_act", nn.ReLU(inplace=True))
+        ]))
 
         # fusion conv 1x1
         self.proj_f = nn.Conv2d(c_d + c_c, channels, 1, bias=False)
+        self.proj_f2 = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.PReLU(num_parameters=channels)
+        )
 
         self.use_eca = use_eca
         if self.use_eca:
-            self.eca = SparseECA(channels, proj_ratio=proj_ratio)
+            self.eca = SECA(channels, proj_ratio=proj_ratio)
         else:
             self.eca = None
 
-        self.res_scale = nn.Parameter(torch.tensor(res_scale, dtype=torch.float32))
+        # optional spatial attention for tail blocks
+        self.esa = ESALite(channels) if enable_esa else None
+
+        self.res_bias = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.base_res_scale = 0.1
 
     def forward(self, x):
         c = x.size(1)
@@ -186,15 +264,51 @@ class DFDBlockLite(nn.Module):
         xd = x[:, :c_d, :, :]
         xc = x[:, c_d:, :, :]
         yd = self.detail(xd)
-        yc = self.context(xc)
+
+        # 判断 context 结构类型
+        if len(self.context) >= 8:
+            # progressive context distillation (Sequential-safe)
+            c1_r, c1_act, c1_d = self.context[0], self.context[1], self.context[2]
+            c2_r, c2_act, c2_d = self.context[3], self.context[4], self.context[5]
+            fuse, fuse_act = self.context[6], self.context[7]
+
+            r1 = c1_act(c1_r(xc))
+            d1 = c1_d(r1)
+            r2 = c2_act(c2_r(d1))
+            d2 = c2_d(r2)
+            yc = fuse_act(fuse(torch.cat([d1, d2, xc[:, :d1.size(1), :, :]], dim=1)))
+        else:
+            # 非渐进结构（DWASPP或简单Conv）
+            yc = self.context(xc)
+
         y = torch.cat([yd, yc], dim=1)
         if self.eca is not None:
             y = y + self.eca(y)
         y = self.proj_f(y)
-        return x + y * self.res_scale
+        y = self.proj_f2(y)
+        if self.esa:
+            y = self.esa(y) * y
+        res_scale = self.base_res_scale + torch.tanh(self.res_bias)
+        return x + y * res_scale
 
-# ---------------- DFDN network ----------------
-class DFDN(nn.Module):
+# ---------------- TailRefine ----------------
+class TailRefine(nn.Module):
+    """A tiny residual refine: DW3x3 -> PW1x1 with PReLU and gated residual."""
+    def __init__(self, channels):
+        super().__init__()
+        self.dw = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=True)
+        self.pw = nn.Conv2d(channels, channels, 1, bias=True)
+        self.act = nn.PReLU(num_parameters=channels)
+        self.alpha = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+
+    def forward(self, x):
+        y = self.dw(x)
+        y = self.act(self.pw(y))
+        alpha = torch.clamp(self.alpha, 0.0, 1.0)
+        return x + y * alpha
+
+# ---------------- DIFRN network (modified with DW-ASPP and ESALite half-coverage) ----------------
+class DIFRN(nn.Module):
     def __init__(self, args, conv=common.default_conv):
         super().__init__()
         n_feats = args.n_feats
@@ -208,10 +322,28 @@ class DFDN(nn.Module):
             nn.PReLU(num_parameters=n_feats)
         )
 
-        # body: stacked DFDBlockLite blocks
+        # Cross-Block Feedback gate
+        self.cbf_gate = nn.Sequential(
+            nn.Conv2d(n_feats, n_feats, 1, bias=True),
+            nn.Sigmoid()
+        )
+
+        # Multi-Scale Gating
+        self.msg = nn.Sequential(
+            nn.AdaptiveAvgPool2d(4),
+            nn.Conv2d(n_feats, n_feats // 4, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(n_feats // 4, n_feats, 1, bias=True),
+            nn.Sigmoid()
+        )
+
+        # body: stacked DIFRBlock blocks
         body = []
         enhanced_start = n_resblocks * 3 // 4
+        esa_start = 0  # enable ESALite for all blocks
         for i in range(n_resblocks):
+            enable_esa = (i >= esa_start)
+            esa_reduce = 0.75 if i >= enhanced_start else 0.5
             if i >= enhanced_start:
                 # enhanced tail blocks with res_scale=0.14 and standard conv in context branch
                 distill_ratio = 0.5
@@ -222,7 +354,7 @@ class DFDN(nn.Module):
                     RepConvBlock(c_d, act=getattr(args,'act','prelu'))
                 )
                 context = nn.Sequential(
-                    nn.Conv2d(c_c, c_c, 3, padding=1, groups=1, bias=False),
+                    nn.Conv2d(c_c, c_c, 5, padding=2, groups=1, bias=False),
                     nn.Conv2d(c_c, c_c, 1, bias=False),
                     nn.ReLU(inplace=True)
                 )
@@ -230,18 +362,35 @@ class DFDN(nn.Module):
                 res_scale_val = 0.14
                 if i == n_resblocks - 1:
                     res_scale_val = 0.15
-                block = DFDBlockLite(n_feats, distill_ratio=distill_ratio, proj_ratio=0.18,
-                                     use_eca=True, act=getattr(args,'act','prelu'), res_scale=res_scale_val)
+                block = DIFRBlock(n_feats, distill_ratio=distill_ratio, proj_ratio=0.18,
+                                     use_eca=True, act=getattr(args,'act','prelu'), res_scale=res_scale_val,
+                                     enable_esa=enable_esa)
                 # replace detail and context with custom ones
                 block.detail = detail
                 block.context = context
+                block.esa = ESALite(n_feats, reduce=esa_reduce)
             else:
-                block = DFDBlockLite(n_feats, distill_ratio=0.5, proj_ratio=0.15,
+                # non-tail blocks: use HybridASPP as context to enlarge receptive field with tiny cost and channel interaction
+                block = DIFRBlock(n_feats, distill_ratio=0.5, proj_ratio=0.15,
                                      use_eca=True, act=getattr(args,'act','prelu'),
-                                     res_scale=0.1)
+                                     res_scale=0.1, enable_esa=enable_esa)
+                # replace default context with HybridASPP (operate on c_c channels)
+                c_d = int(n_feats * 0.5)
+                c_c = n_feats - c_d
+                block.context = nn.Sequential(
+                    HybridASPP(c_c, rates=(1,2,3,5))
+                )
+                block.esa = ESALite(n_feats, reduce=esa_reduce)
             body.append(block)
         body.append(conv(n_feats, n_feats, 3, bias=False))
         self.body = nn.Sequential(*body)
+
+        # cross-stage feature fusion (lite)
+        self.csff = nn.Sequential(
+            nn.Conv2d(n_feats, n_feats, 1, bias=True),
+            nn.PReLU(num_parameters=n_feats),
+            SECA(n_feats, proj_ratio=0.2)
+        )
 
         # tail
         scale = args.scale[0] if isinstance(args.scale, (list,tuple)) else args.scale
@@ -250,6 +399,40 @@ class DFDN(nn.Module):
             nn.Conv2d(n_feats, args.n_colors, 3, padding=1, bias=False)
         )
 
+        # final tiny refine
+        self.tail_refine = TailRefine(n_feats)
+
+        # Tail Attention module
+        self.tail_att = nn.Sequential(
+            nn.Conv2d(n_feats, n_feats, 1, bias=True),
+            nn.PReLU(num_parameters=n_feats),
+            SECA(n_feats, proj_ratio=0.18)
+        )
+
+        # lightweight pixel attention
+        self.pixel_att = PixelAttention(n_feats)
+
+        # Residual Group size (number of blocks per residual group)
+        # default to 2, can be overridden by args.rg_size
+        self.rg_size = getattr(args, 'rg_size', 2)
+
+        # Multi-stage CSFF modules (lightweight)
+        self.csff1 = nn.Sequential(
+            nn.Conv2d(n_feats, n_feats, 1, bias=True),
+            nn.PReLU(num_parameters=n_feats),
+            SECA(n_feats, proj_ratio=0.18)
+        )
+        self.csff2 = nn.Sequential(
+            nn.Conv2d(n_feats, n_feats, 1, bias=True),
+            nn.PReLU(num_parameters=n_feats),
+            SECA(n_feats, proj_ratio=0.20)
+        )
+
+    def apply_msg(self, x):
+        gate = self.msg(x)
+        gate = F.interpolate(gate, size=(x.size(2), x.size(3)), mode='bilinear', align_corners=False)
+        return gate
+
     def forward(self, x):
         x = self.sub_mean(x)
         h = self.head(x)
@@ -257,10 +440,57 @@ class DFDN(nn.Module):
         last = body_layers[-1]
         blocks = body_layers[:-1]
         out = h
-        for block in blocks:
+        enhanced_start = len(blocks) * 3 // 4
+        mid_feat = None
+        mid1_feat = None
+        mid2_feat = None
+
+        total_blocks = len(blocks)
+        mid1_idx = max(0, total_blocks // 2 - 1)
+        mid2_idx = max(0, total_blocks * 3 // 4 - 1)
+
+        feedback = None
+        # iterate with residual grouping (res-in-res)
+        for i, block in enumerate(blocks):
+            # record group input at group start
+            if (i % self.rg_size) == 0:
+                group_input = out
+
+            if i == len(blocks) - 3:
+                feedback = self.cbf_gate(out)
             out = block(out)
+            if i >= len(blocks) - 2 and feedback is not None:
+                out = out * (1 + 0.5 * feedback)
+
+            if i == mid1_idx:
+                mid1_feat = out
+            if i == mid2_idx:
+                mid2_feat = out
+
+            # group residual add
+            if ((i + 1) % self.rg_size) == 0 or (i == total_blocks - 1):
+                out = group_input + out
+
+            # capture the enhanced_start mid feature for original csff
+            if i == enhanced_start - 1:
+                mid_feat = out
+
         res = last(out)
         res = res + h
+
+        # apply multi-stage csff
+        if mid1_feat is not None:
+            res = res + self.csff1(mid1_feat)
+        if mid2_feat is not None:
+            res = res + self.csff2(mid2_feat)
+
+        if mid_feat is not None:
+            res = res + self.csff(mid_feat)
+
+        res = self.tail_refine(res)
+        res = self.tail_att(res)
+        res = res * (1 + 0.5 * self.apply_msg(res))
+        res = self.pixel_att(res)
         x = self.tail(res)
         x = self.add_mean(x)
         return x
@@ -268,21 +498,31 @@ class DFDN(nn.Module):
     def convert_to_deploy(self):
         # convert all RepConv inside detail branches
         for m in self.modules():
-            if isinstance(m, DFDBlockLite):
+            if isinstance(m, DIFRBlock):
                 for subm in m.detail.modules():
                     if isinstance(subm, RepConvBlock):
                         subm.convert_to_deploy()
 
+    # ---------------- lightweight pixel attention ----------------
+ # PA-Gate: gated pixel attention for bidirectional control
+class PixelAttention(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, 1, 1)
+    def forward(self, x):
+        att = torch.tanh(self.conv(x))
+        return x * (1 + 0.5 * att)
+
 # ---------------- factory and diagnostics ----------------
 def make_model(args, parent=False):
-    net = DFDN(args)
+    net = DIFRN(args)
     check_modules(net)
     return net
 
 def check_modules(net):
     has_rep = any(isinstance(m, RepConvBlock) for m in net.modules())
-    has_eca = any(isinstance(m, SparseECA) for m in net.modules())
-    print(f"[INFO] RepConv: {has_rep}, SparseECA: {has_eca}")
+    has_eca = any(isinstance(m, SECA) for m in net.modules())
+    print(f"[INFO] Model: DIFRN, RepConv: {has_rep}, SECA: {has_eca}")
     # print params (safe on CPU)
     params = sum(p.numel() for p in net.parameters())
     print(f"Params: {params/1e3:.1f}K")

@@ -3,14 +3,15 @@ import torch.nn as nn
 from model import block as B
 
 def make_model(args, parent=False):
-    model = RFDN()
+    model = RFDN(args)
+    check_modules(model)
     return model
 
 
 class RFDN(nn.Module):
-    def __init__(self, in_nc=3, nf=50, num_modules=4, out_nc=3, upscale=4):
+    def __init__(self,args, in_nc=3, nf=50, num_modules=4, out_nc=3, upscale=4):
         super(RFDN, self).__init__()
-
+        scale = args.scale[0] 
         self.fea_conv = B.conv_layer(in_nc, nf, kernel_size=3)
 
         self.B1 = B.RFDB(in_channels=nf)
@@ -22,7 +23,7 @@ class RFDN(nn.Module):
         self.LR_conv = B.conv_layer(nf, nf, kernel_size=3)
 
         upsample_block = B.pixelshuffle_block
-        self.upsampler = upsample_block(nf, out_nc, upscale_factor=4)
+        self.upsampler = upsample_block(nf, out_nc, upscale_factor=scale)
         self.scale_idx = 0
 
 
@@ -42,3 +43,8 @@ class RFDN(nn.Module):
 
     def set_scale(self, scale_idx):
         self.scale_idx = scale_idx
+
+
+def check_modules(net):
+    params = sum(p.numel() for p in net.parameters())
+    print(f"Params: {params/1e3:.1f}K")
