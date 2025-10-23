@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import time
 import csv
-from thop import profile
+from torchinfo import summary
 import model
 from option import args
 import utility
@@ -10,32 +10,14 @@ import os
 from datetime import datetime
 import warnings
 args.n_feats = 64
-args.n_resblocks = 16
+args.n_resblocks = 8
 
 # Initialize checkpoint
 checkpoint = utility.checkpoint(args)
 
 
-def select_device(preferred_device=None):
-    """
-    自动选择设备（优先级：CUDA > MPS > CPU），或使用用户指定的 preferred_device。
-    """
-    if preferred_device is not None:
-        if preferred_device == 'cuda' and torch.cuda.is_available():
-            return 'cuda'
-        if preferred_device == 'mps' and getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
-            return 'mps'
-        if preferred_device == 'cpu':
-            return 'cpu'
-    # 自动选择
-    if torch.cuda.is_available():
-        return 'cuda'
-    if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
-        return 'mps'
-    return 'cpu'
-
-
-def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_runs=100,
+def benchmark(model_name, scale=2, input_size=96,
+              n_warmup=10, n_runs=100,
               use_dwconv=False, use_attention=False, use_fullres=False):
     """
     对单个模型进行基准测试：参数量、FLOPs 与推理耗时（FPS）。
@@ -50,7 +32,7 @@ def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_r
     args.scale = [scale]
     try:
         # 参数量统计（载入模型一次）
-        net_params = model.Model(args, checkpoint).to(device)
+        net_params = model.Model(args, checkpoint)
         
         num_params = sum(p.numel() for p in net_params.parameters() if p.requires_grad)
         del net_params
@@ -61,13 +43,13 @@ def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_r
         else:
             lr_h = lr_w = input_size
 
-        # FLOPs 统计（使用 thop profile）
-        net_flops = model.Model(args, checkpoint).to(device)
+        # FLOPs 统计（使用 torchinfo.summary）
+        net_flops = model.Model(args, checkpoint)
         net_flops.eval()
-        module_for_profile = getattr(net_flops, 'model', net_flops).to(device)
-        x = torch.randn(1, args.n_colors, lr_h, lr_w).to(device)
+        x = torch.randn(1, args.n_colors, lr_h, lr_w).to(net_flops.device)
         try:
-            flops, _ = profile(module_for_profile, inputs=(x,), verbose=False)
+            info = summary(net_flops.model, input_data=x, verbose=0)
+            flops = 2 * info.total_mult_adds  # MACs -> FLOPs
         except Exception as e:
             warnings.warn(f"FLOPs profiling failed: {e}")
             flops = 0.0
@@ -77,14 +59,14 @@ def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_r
         # 稳定推理时间测量（多轮采样）
         # -------------------------
         import numpy as np
-        net_infer = model.Model(args, checkpoint).to(device)
+        net_infer = model.Model(args, checkpoint)
         net_infer.eval()
-        dummy_input = torch.randn(1, 3, lr_h, lr_w).to(device)
+        dummy_input = torch.randn(1, 3, lr_h, lr_w).to(net_infer.device)
 
         def sync():
-            if device == "cuda":
+            if net_infer.device.type == "cuda":
                 torch.cuda.synchronize()
-            elif device == "mps":
+            elif net_infer.device.type == "mps":
                 torch.mps.synchronize()
 
         with torch.no_grad():
@@ -148,9 +130,7 @@ def benchmark(model_name, scale=2, input_size=96, device='cpu', n_warmup=10, n_r
 
 
 
-def benchmark_all(save_csv=True, preferred_device=None):
-    device = select_device(preferred_device)
-    print(f"Using device: {device}\n")
+def benchmark_all(save_csv=True):
     results = []
 
     configs = [
@@ -166,7 +146,6 @@ def benchmark_all(save_csv=True, preferred_device=None):
             model_name=cfg["model_name"],
             scale=2,
             input_size=96,
-            device=device,
             use_dwconv=cfg["use_dwconv"],
             use_attention=cfg["use_attention"],
             use_fullres=False
