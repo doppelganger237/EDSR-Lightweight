@@ -116,15 +116,19 @@ class ULAttentionPlus(nn.Module):
     - 空间注意力：avg+max pooling -> DWConv+PWConv -> h-sigmoid
     - 残差融合输出
     """
-    def __init__(self, channel, gamma_init=0.1):
+    def __init__(self, channel, gamma_init=0.1, use_simam=False):
         super().__init__()
+        self.use_simam = use_simam
         # 通道注意力（ECA）
         self.eca_conv = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
         # GroupNorm 替代 LayerNorm
         self.norm = GroupNormLayer(channel, num_groups=32)
         # 空间注意力（轻量结构）
-        self.sa_dw = nn.Conv2d(2, 2, 3, padding=1, groups=2, bias=False)
-        self.sa_pw = nn.Conv2d(2, 1, 1, bias=False)
+        if not use_simam:
+            self.sa_dw = nn.Conv2d(2, 2, 3, padding=1, groups=2, bias=False)
+            self.sa_pw = nn.Conv2d(2, 1, 1, bias=False)
+        else:
+            self.simam = SimAM()
 
     def forward(self, x):
         b, c, h, w = x.size()
@@ -141,16 +145,47 @@ class ULAttentionPlus(nn.Module):
         x_ca = self.norm(x_ca)
 
         # --- 空间注意力 ---
-        avg = torch.mean(x_ca, dim=1, keepdim=True)
-        mx, _ = torch.max(x_ca, dim=1, keepdim=True)
-        sa = torch.cat([avg, mx], dim=1)
-        sa = self.sa_pw(self.sa_dw(sa))
-        sa = F.hardsigmoid(sa)
-        x_sa = x_ca * sa
+        if self.use_simam:
+            x_sa = self.simam(x_ca)
+        else:
+            avg = torch.mean(x_ca, dim=1, keepdim=True)
+            mx, _ = torch.max(x_ca, dim=1, keepdim=True)
+            sa = torch.cat([avg, mx], dim=1)
+            sa = self.sa_pw(self.sa_dw(sa))
+            sa = F.hardsigmoid(sa)
+            x_sa = x_ca * sa
 
         # --- 残差融合 ---
         out = x + x_sa
         return out
+
+class SimAM(nn.Module):
+    def __init__(self, e_lambda=1e-4):
+        super().__init__()
+        self.e_lambda = e_lambda
+
+    def forward(self, x):
+        mean = x.mean(dim=(2, 3), keepdim=True)
+        var = ((x - mean) ** 2).mean(dim=(2, 3), keepdim=True)
+        energy = (x - mean) ** 2 / (4 * (var + self.e_lambda)) + 0.5
+        return x * torch.sigmoid(energy)
+
+# --- 轻量特征蒸馏模块（低参数版本） ---
+class FeatureDistillationBlock(nn.Module):
+    """融合版轻量蒸馏模块：带1×1通道融合"""
+    def __init__(self, c, dist_ratio=0.25):
+        super().__init__()
+        d_c = int(c * dist_ratio)
+        self.fuse = nn.Conv2d(c, c, kernel_size=1, bias=True)
+        self.conv1 = nn.Conv2d(c, d_c, kernel_size=1, bias=True)
+        self.conv2 = nn.Conv2d(d_c, c, kernel_size=3, padding=1, bias=True)
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        x_fuse = self.act(self.fuse(x))
+        distilled = self.act(self.conv1(x_fuse))
+        fused = self.act(self.conv2(distilled))
+        return x + fused
 
 # --- 残差块结构 ---
 class SDWResidualBlock(nn.Module):
@@ -178,7 +213,7 @@ class SDWResidualBlock(nn.Module):
             self.conv2 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
 
         if self.use_attention:
-            self.att = ULAttentionPlus(channels, gamma_init=0.1)
+            self.att = ULAttentionPlus(channels, gamma_init=0.1, use_simam=True)
             self.proj_out = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
             self.alpha = nn.Parameter(torch.ones(channels, 1, 1) * 0.1)
         else:
@@ -239,20 +274,19 @@ class ULRNet(nn.Module):
         # 网络主体：残差块堆叠 + 额外卷积
         m_body = []
         if use_dw:
-            for i in range(n_resblocks):
-                if i < n_resblocks // 2:
-                    # 前半段: 使用NAFBlock
-                    m_body.append(
-                        NAFBlock(n_feats)
+            # 前半段: 使用 NAFBlock
+            for _ in range(n_resblocks // 2):
+                m_body.append(NAFBlock(n_feats))
+            # 中间连接层: 特征融合 + 蒸馏
+            # m_body.append(FeatureDistillationBlock(n_feats))  # 已移除或注释
+            # 后半段: 启用 DWConv 和 Attention
+            for _ in range(n_resblocks // 2, n_resblocks):
+                m_body.append(
+                    SDWResidualBlock(
+                        n_feats, kernel_size=kernel_size, res_scale=args.res_scale,
+                        use_dwconv=True, use_attention=use_att
                     )
-                else:
-                    # 后半段: 启用DWConv和Attention
-                    m_body.append(
-                        SDWResidualBlock(
-                            n_feats, kernel_size=kernel_size, res_scale=args.res_scale,
-                            use_dwconv=True, use_attention=use_att
-                        )
-                    )
+                )
         else:
             for i in range(n_resblocks):
                 m_body.append(
@@ -317,3 +351,6 @@ def check_modules(net):
     params = sum(p.numel() for p in net.parameters())
     print(f"Params: {params/1e3:.1f}K")
     print(f"[INFO] SDWConv: {has_gadw}, ULAttentionPlus: {has_ulatt}")
+
+    print('NAF blocks:', sum(isinstance(m, NAFBlock) for m in net.modules()))
+    print('SDW blocks:', sum(isinstance(m, SDWResidualBlock) for m in net.modules()))
