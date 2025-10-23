@@ -28,7 +28,7 @@ class ResBlock(nn.Module):
         self.res_scale = res_scale
         self.use_attention = use_attention
         if self.use_attention:
-            self.att = ULAttentionPlus(n_feats, gamma_init=0.1)
+            self.att = ULAttentionPlus(n_feats)
             self.proj_out = nn.Conv2d(n_feats, n_feats, kernel_size=1, bias=True)
             self.alpha = nn.Parameter(torch.ones(n_feats, 1, 1) * 0.1)
         else:
@@ -48,15 +48,21 @@ class ResBlock(nn.Module):
             return x + res
         
 
-# --- GroupNormLayer 替换 LayerNorm ---
-class GroupNormLayer(nn.Module):
-    def __init__(self, num_channels, num_groups=32, eps=1e-6):
+
+# --- LayerNorm2d 替换 GroupNorm ---
+class LayerNorm2d(nn.Module):
+    """LayerNorm for Conv2d feature maps (B, C, H, W)"""
+    def __init__(self, c, eps=1e-6):
         super().__init__()
-        # 保证组数不能大于通道数
-        self.num_groups = min(num_groups, num_channels)
-        self.gn = nn.GroupNorm(self.num_groups, num_channels, eps=eps, affine=True)
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(1, c, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, c, 1, 1))
+
     def forward(self, x):
-        return self.gn(x)
+        mean = x.mean(dim=1, keepdim=True)
+        var = (x - mean).pow(2).mean(dim=1, keepdim=True)
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        return x * self.weight + self.bias
 
 
 # --- 轻量深度卷积模块 ---
@@ -84,7 +90,7 @@ class NAFBlock(nn.Module):
     def __init__(self, c, expansion=2):
         super().__init__()
         hidden = c * expansion
-        self.norm = GroupNormLayer(c, num_groups=32)
+        self.norm = LayerNorm2d(c)
         self.pw1 = nn.Conv2d(c, hidden * 2, 1, bias=True)
         self.dw = nn.Conv2d(hidden * 2, hidden * 2, kernel_size=5, padding=2, groups=hidden * 2, bias=True)
         self.sg = SimpleGate()
@@ -116,19 +122,14 @@ class ULAttentionPlus(nn.Module):
     - 空间注意力：avg+max pooling -> DWConv+PWConv -> h-sigmoid
     - 残差融合输出
     """
-    def __init__(self, channel, gamma_init=0.1, use_simam=False):
+    def __init__(self, channel):
         super().__init__()
-        self.use_simam = use_simam
         # 通道注意力（ECA）
         self.eca_conv = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
-        # GroupNorm 替代 LayerNorm
-        self.norm = GroupNormLayer(channel, num_groups=32)
-        # 空间注意力（轻量结构）
-        if not use_simam:
-            self.sa_dw = nn.Conv2d(2, 2, 3, padding=1, groups=2, bias=False)
-            self.sa_pw = nn.Conv2d(2, 1, 1, bias=False)
-        else:
-            self.simam = SimAM()
+        # LayerNorm2d 替代 GroupNorm
+        self.norm = LayerNorm2d(channel)
+        # 空间注意力（SimAM）
+        self.simam = SimAM()
 
     def forward(self, x):
         b, c, h, w = x.size()
@@ -145,15 +146,7 @@ class ULAttentionPlus(nn.Module):
         x_ca = self.norm(x_ca)
 
         # --- 空间注意力 ---
-        if self.use_simam:
-            x_sa = self.simam(x_ca)
-        else:
-            avg = torch.mean(x_ca, dim=1, keepdim=True)
-            mx, _ = torch.max(x_ca, dim=1, keepdim=True)
-            sa = torch.cat([avg, mx], dim=1)
-            sa = self.sa_pw(self.sa_dw(sa))
-            sa = F.hardsigmoid(sa)
-            x_sa = x_ca * sa
+        x_sa = self.simam(x_ca)
 
         # --- 残差融合 ---
         out = x + x_sa
@@ -187,48 +180,47 @@ class FeatureDistillationBlock(nn.Module):
         fused = self.act(self.conv2(distilled))
         return x + fused
 
+# 新增 Fusion1x1 类
+class Fusion1x1(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.fuse = nn.Conv2d(c * 2, c, kernel_size=1, bias=True)
+        self.act = nn.SiLU(inplace=True)
+    def forward(self, x1, x2):
+        out = torch.cat([x1, x2], dim=1)
+        out = self.fuse(out)
+        out = self.act(out)
+        return out
+
 # --- 残差块结构 ---
 class SDWResidualBlock(nn.Module):
     """SDWResidualBlock：残差块，包含两层轻量卷积、高频增强及统一注意力"""
-    def __init__(self, channels, kernel_size=3, res_scale=1,
-                 use_dwconv=True, use_attention=True):
+    def __init__(self, channels, kernel_size=3, res_scale=1):
         super().__init__()
         self.res_scale = res_scale
-        self.use_dwconv = use_dwconv
-        self.use_attention = use_attention
         padding = kernel_size // 2
 
-        if use_dwconv:
-            # 第一层保持3x3（局部特征）
-            self.conv1 = SDWConv(channels, kernel_size=3)
-            # 第二层使用 dilated DWConv (5×5, dilation=2)
-            self.conv2 = nn.Sequential(
-                nn.Conv2d(channels, channels, kernel_size=5, padding=2*2, dilation=2, groups=channels, bias=True),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(channels, channels, kernel_size=1, bias=True),
-                nn.SiLU(inplace=True)
-            )
-        else:
-            self.conv1 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
-            self.conv2 = nn.Conv2d(channels, channels, kernel_size, padding=padding, bias=True)
+        # 第一层保持3x3（局部特征）
+        self.conv1 = SDWConv(channels, kernel_size=3)
+        # 第二层使用 dilated DWConv (5×5, dilation=2)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=5, padding=2*2, dilation=2, groups=channels, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=True),
+            nn.SiLU(inplace=True)
+        )
 
-        if self.use_attention:
-            self.att = ULAttentionPlus(channels, gamma_init=0.1, use_simam=True)
-            self.proj_out = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-            self.alpha = nn.Parameter(torch.ones(channels, 1, 1) * 0.1)
-        else:
-            self.att = None
-            self.proj_out = None
-            self.alpha = None
+        self.att = ULAttentionPlus(channels)
+        self.proj_out = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.alpha = nn.Parameter(torch.ones(channels, 1, 1) * 0.1)
 
-        # 只有在使用深度卷积时，创建固定拉普拉斯高频增强卷积核
-        if self.use_dwconv:
-            lap_kernel = torch.tensor([[0, -1, 0],
-                                       [-1, 4, -1],
-                                       [0, -1, 0]], dtype=torch.float32)
-            self.register_buffer('lap_kernel', lap_kernel.unsqueeze(0).unsqueeze(0))
-            # 固定高频增强强度，稳定训练
-            self.hf_scale = 0.05  # 固定高频增强强度，稳定训练
+        # 创建固定拉普拉斯高频增强卷积核
+        lap_kernel = torch.tensor([[0, -1, 0],
+                                   [-1, 4, -1],
+                                   [0, -1, 0]], dtype=torch.float32)
+        self.register_buffer('lap_kernel', lap_kernel.unsqueeze(0).unsqueeze(0))
+        # 固定高频增强强度，稳定训练
+        self.hf_scale = 0.05  # 固定高频增强强度，稳定训练
 
     def forward(self, x):
         # 第一层轻量卷积
@@ -236,20 +228,16 @@ class SDWResidualBlock(nn.Module):
         # 第二层轻量卷积
         out = self.conv2(out)
 
-        # 只有在使用深度卷积时，做高频增强
-        if self.use_dwconv:
-            freq_out = F.conv2d(x, self.lap_kernel.repeat(x.size(1), 1, 1, 1), padding=1, groups=x.size(1))
-            out = out + self.hf_scale * freq_out
+        # 高频增强
+        freq_out = F.conv2d(x, self.lap_kernel.repeat(x.size(1), 1, 1, 1), padding=1, groups=x.size(1))
+        out = out + self.hf_scale * freq_out
 
         out = out * self.res_scale
 
-        if self.use_attention and self.att is not None:
-            y_att = self.att(out)
-            y = self.proj_out(y_att)
-            scaled_alpha = self.alpha
-            return x + out + scaled_alpha * y
-        else:
-            return x + out
+        y_att = self.att(out)
+        y = self.proj_out(y_att)
+        scaled_alpha = self.alpha
+        return x + out + scaled_alpha * y
 
 
 # --- 主干网络 ---
@@ -277,14 +265,12 @@ class ULRNet(nn.Module):
             # 前半段: 使用 NAFBlock
             for _ in range(n_resblocks // 2):
                 m_body.append(NAFBlock(n_feats))
-            # 中间连接层: 特征融合 + 蒸馏
-            # m_body.append(FeatureDistillationBlock(n_feats))  # 已移除或注释
+            self.fusion = Fusion1x1(n_feats)
             # 后半段: 启用 DWConv 和 Attention
             for _ in range(n_resblocks // 2, n_resblocks):
                 m_body.append(
                     SDWResidualBlock(
-                        n_feats, kernel_size=kernel_size, res_scale=args.res_scale,
-                        use_dwconv=True, use_attention=use_att
+                        n_feats, kernel_size=kernel_size, res_scale=args.res_scale
                     )
                 )
         else:
@@ -312,8 +298,14 @@ class ULRNet(nn.Module):
         # 浅层特征提取
         x = self.head(x)
 
-        # 残差块堆栈
-        res = self.body(x)
+        # 分割 body 为前半段和后半段
+        n_resblocks = len([m for m in self.body if isinstance(m, (NAFBlock, SDWResidualBlock))])
+        half = n_resblocks // 2
+        naf_out = self.body[:half](x)
+        sdw_out = self.body[half:-1](naf_out)
+        fused = self.fusion(naf_out, sdw_out)
+        res = self.body[-1](fused)
+
         # 残差连接
         res += x
 

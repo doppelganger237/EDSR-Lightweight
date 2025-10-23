@@ -128,6 +128,25 @@ class ESA(nn.Module):
         
         return x * m
 
+class CCA(nn.Module):
+    """Contrast-Aware Channel Attention (CCA) Module from RFDN"""
+    def __init__(self, channel, reduction=4):
+        super(CCA, self).__init__()
+        self.conv_du = nn.Sequential(
+            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # 对比敏感特征增强：同时利用均值和标准差
+        avg_out = torch.mean(x, dim=(2,3), keepdim=True)
+        std_out = torch.std(x, dim=(2,3), keepdim=True)
+        y = avg_out + std_out
+        y = self.conv_du(y)
+        return x * y
+
 
 class RFDB(nn.Module):
     def __init__(self, in_channels, distillation_rate=0.25):
@@ -143,7 +162,7 @@ class RFDB(nn.Module):
         self.c4 = conv_layer(self.remaining_channels, self.dc, 3)
         self.act = activation('lrelu', neg_slope=0.05)
         self.c5 = conv_layer(self.dc*4, in_channels, 1)
-        self.esa = ESA(in_channels, nn.Conv2d)
+        self.cca = CCA(in_channels)
 
     def forward(self, input):
         distilled_c1 = self.act(self.c1_d(input))
@@ -161,7 +180,7 @@ class RFDB(nn.Module):
         r_c4 = self.act(self.c4(r_c3))
 
         out = torch.cat([distilled_c1, distilled_c2, distilled_c3, r_c4], dim=1)
-        out_fused = self.esa(self.c5(out)) 
+        out_fused = self.cca(self.c5(out)) 
 
         return out_fused
 
