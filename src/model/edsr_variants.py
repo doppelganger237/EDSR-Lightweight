@@ -13,41 +13,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from model import common
 
-class ResBlock(nn.Module):
-    """ResBlock: 标准残差块，支持可选注意力模块"""
-    def __init__(self, conv, n_feats, kernel_size, bias=True, bn=False, act=nn.SiLU(True), res_scale=1, use_attention=False):
-        super().__init__()
-        m = []
-        for i in range(2):
-            m.append(conv(n_feats, n_feats, kernel_size, bias=bias))
-            if bn:
-                m.append(nn.BatchNorm2d(n_feats))
-            if i == 0:
-                m.append(act)
-        self.body = nn.Sequential(*m)
-        self.res_scale = res_scale
-        self.use_attention = use_attention
-        if self.use_attention:
-            self.att = ULAttentionPlus(n_feats)
-            self.proj_out = nn.Conv2d(n_feats, n_feats, kernel_size=1, bias=True)
-            self.alpha = nn.Parameter(torch.ones(n_feats, 1, 1) * 0.1)
-        else:
-            self.att = None
-            self.proj_out = None
-            self.alpha = None
-
-    def forward(self, x):
-        res = self.body(x)
-        res = res * self.res_scale
-        if self.use_attention and self.att is not None:
-            y_att = self.att(res)
-            y = self.proj_out(y_att)
-            scaled_alpha = self.alpha
-            return x + res + scaled_alpha * y
-        else:
-            return x + res
-        
-
 
 # --- LayerNorm2d 替换 GroupNorm ---
 class LayerNorm2d(nn.Module):
@@ -96,6 +61,7 @@ class NAFBlock(nn.Module):
         self.sg = SimpleGate()
         self.pw2 = nn.Conv2d(hidden, c, 1, bias=True)
         self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)))
+        self.att = ULAttentionPlus(c)
 
     def forward(self, x):
         res = self.norm(x)
@@ -103,6 +69,7 @@ class NAFBlock(nn.Module):
         res = self.dw(res)
         res = self.sg(res)
         res = self.pw2(res)
+        res = self.att(res)  
         return x + self.beta * res
 
 
@@ -162,23 +129,6 @@ class SimAM(nn.Module):
         var = ((x - mean) ** 2).mean(dim=(2, 3), keepdim=True)
         energy = (x - mean) ** 2 / (4 * (var + self.e_lambda)) + 0.5
         return x * torch.sigmoid(energy)
-
-# --- 轻量特征蒸馏模块（低参数版本） ---
-class FeatureDistillationBlock(nn.Module):
-    """融合版轻量蒸馏模块：带1×1通道融合"""
-    def __init__(self, c, dist_ratio=0.25):
-        super().__init__()
-        d_c = int(c * dist_ratio)
-        self.fuse = nn.Conv2d(c, c, kernel_size=1, bias=True)
-        self.conv1 = nn.Conv2d(c, d_c, kernel_size=1, bias=True)
-        self.conv2 = nn.Conv2d(d_c, c, kernel_size=3, padding=1, bias=True)
-        self.act = nn.SiLU(inplace=True)
-
-    def forward(self, x):
-        x_fuse = self.act(self.fuse(x))
-        distilled = self.act(self.conv1(x_fuse))
-        fused = self.act(self.conv2(distilled))
-        return x + fused
 
 # 新增 Fusion1x1 类
 class Fusion1x1(nn.Module):
@@ -250,9 +200,6 @@ class ULRNet(nn.Module):
         n_feats = args.n_feats
         scale = args.scale[0]
 
-        use_dw = args.use_dwconv
-        use_att = args.use_attention
-
         self.sub_mean = common.MeanShift(args.rgb_range)
         self.add_mean = common.MeanShift(args.rgb_range, sign=1)
 
@@ -261,25 +208,17 @@ class ULRNet(nn.Module):
 
         # 网络主体：残差块堆叠 + 额外卷积
         m_body = []
-        if use_dw:
-            # 前半段: 使用 NAFBlock
-            for _ in range(n_resblocks // 2):
-                m_body.append(NAFBlock(n_feats))
-            self.fusion = Fusion1x1(n_feats)
-            # 后半段: 启用 DWConv 和 Attention
-            for _ in range(n_resblocks // 2, n_resblocks):
-                m_body.append(
-                    SDWResidualBlock(
-                        n_feats, kernel_size=kernel_size, res_scale=args.res_scale
-                    )
+        # 前半段: 使用 NAFBlock
+        for _ in range(n_resblocks // 2):
+            m_body.append(NAFBlock(n_feats))
+        self.fusion = Fusion1x1(n_feats)
+        # 后半段: 启用 DWConv 和 Attention
+        for _ in range(n_resblocks // 2, n_resblocks):
+            m_body.append(
+                SDWResidualBlock(
+                    n_feats, kernel_size=kernel_size, res_scale=args.res_scale
                 )
-        else:
-            for i in range(n_resblocks):
-                m_body.append(
-                    ResBlock(
-                        conv, n_feats, kernel_size, res_scale=args.res_scale, use_attention=use_att
-                    )
-                )
+            )
         m_body.append(conv(n_feats, n_feats, kernel_size))
 
         # 网络尾部：上采样与颜色恢复
