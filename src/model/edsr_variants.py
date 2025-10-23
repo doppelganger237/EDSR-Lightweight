@@ -14,71 +14,70 @@ import torch.nn.functional as F
 from model import common
 
 
-# --- LayerNorm2d 替换 GroupNorm ---
-class LayerNorm2d(nn.Module):
-    """LayerNorm for Conv2d feature maps (B, C, H, W)
-    实现对每个通道的归一化，保持空间维度不变，类似于通道层归一化。
-    """
-    def __init__(self, c, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(1, c, 1, 1))
-        self.bias = nn.Parameter(torch.zeros(1, c, 1, 1))
-
-    def forward(self, x):
-        mean = x.mean(dim=1, keepdim=True)
-        var = (x - mean).pow(2).mean(dim=1, keepdim=True)
-        x = (x - mean) / torch.sqrt(var + self.eps)
-        return x * self.weight + self.bias
-
-
 # --- 轻量深度卷积模块 ---
 class SDWConv(nn.Module):
     """SDWConv：轻量深度卷积"""
     def __init__(self, channels, kernel_size=3):
         super().__init__()
         padding = kernel_size // 2
-        self.dw = nn.Conv2d(channels, channels, kernel_size, padding=padding, groups=channels, bias=True)
-        self.pw = nn.Conv2d(channels, channels, 1, bias=True)
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size, padding=padding, groups=channels, bias=True),
+            nn.Conv2d(channels, channels, 1, bias=True),
+            nn.ReLU(inplace=True)
+        )
 
 
     def forward(self, x):
-        out = self.dw(x)
-        out = F.silu(out, inplace=True)
-        out = self.pw(out)
-        out = F.silu(out, inplace=True)
+        out = self.conv(x)
         # Mean+Std通道增强，使用var_mean替换
         var_mean = torch.var_mean(out, dim=(2, 3), keepdim=True, unbiased=False)
         y = var_mean[1] + var_mean[0].sqrt()
         return out * (1 + 0.2 * y)
 
 
-class NAFBlock(nn.Module):
-    def __init__(self, c, expansion=2):
-        super().__init__()
-        hidden = c * expansion
-        self.norm = LayerNorm2d(c)
-        self.pw1 = nn.Conv2d(c, hidden * 2, 1, bias=True)
-        self.dw = nn.Conv2d(hidden * 2, hidden * 2, kernel_size=5, padding=2, groups=hidden * 2, bias=True)
-        self.sg = SimpleGate()
-        self.pw2 = nn.Conv2d(hidden, c, 1, bias=True)
-        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)))
-        self.att = ULAttentionPlus(c)
-
-    def forward(self, x):
-        res = self.norm(x)
-        res = self.pw1(res)
-        res = self.dw(res)
-        res = self.sg(res)
-        res = self.pw2(res)
-        res = self.att(res)  
-        return x + self.beta * res
-
-
 class SimpleGate(nn.Module):
     def forward(self, x):
         x1, x2 = x.chunk(2, dim=1)
         return x1 * x2
+
+
+class NAFBlock(nn.Module):
+    """官方论文 NAFBlock 实现"""
+    def __init__(self, c, expansion=2, reduction=16, e_lambda=1e-4):
+        super().__init__()
+        hidden = c * expansion
+
+        # 第一条路径: PW1 -> SG1 -> DW -> ECA -> PW2
+        self.pw1 = nn.Conv2d(c, hidden * 2, 1, bias=True)
+        self.sg1 = SimpleGate()
+        self.dw = nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden, bias=True)
+        self.eca = ECA(hidden, k_size=3)
+        self.pw2 = nn.Conv2d(hidden, c, 1, bias=True)
+        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)))
+
+        # 第二条路径: PW3 -> SG2 -> PW4 (FFN2)
+        self.pw3 = nn.Conv2d(c, hidden * 2, 1, bias=True)
+        self.sg2 = SimpleGate()
+        self.pw4 = nn.Conv2d(hidden, c, 1, bias=True)
+        self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)))
+
+    def forward(self, x):
+        shortcut = x
+
+        # 第一条路径
+        x1 = self.pw1(x)
+        x1 = self.sg1(x1)
+        x1 = self.dw(x1)
+        x1 = self.eca(x1)
+        x1 = self.pw2(x1)
+        x = shortcut + self.beta * x1
+
+        # 第二条路径 (FFN2)
+        x2 = self.pw3(x)
+        x2 = self.sg2(x2)
+        x2 = self.pw4(x2)
+        out = x + self.gamma * x2
+        return out
 
 
 # --- 统一通道与空间注意力模块 ---
@@ -93,10 +92,10 @@ class ULAttentionPlus(nn.Module):
     """
     def __init__(self, channel):
         super().__init__()
-        # 通道注意力（ECA）
-        self.eca_conv = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
-        # LayerNorm2d 替代 GroupNorm
-        self.norm = LayerNorm2d(channel)
+        # 通道注意力（ECA）2D实现
+        self.eca_conv = nn.Conv2d(channel, channel, kernel_size=3, padding=1, groups=channel, bias=False)
+        # GroupNorm 替代 LayerNorm2d
+        self.norm = nn.GroupNorm(1, channel, eps=1e-6, affine=True)
         # 空间注意力（SimAM）
         self.simam = SimAM()
 
@@ -105,10 +104,7 @@ class ULAttentionPlus(nn.Module):
         # --- 通道注意力 ---
         var_mean = torch.var_mean(x, dim=(2,3), keepdim=True, unbiased=False)
         y = var_mean[1] + var_mean[0].sqrt()
-        y = y.squeeze(-1).permute(0, 2, 1)  # B x 1 x C
-        y = self.eca_conv(y)
-        ca_map = torch.sigmoid(y.permute(0, 2, 1).unsqueeze(-1))  # B x C x 1 x 1
-        ca_map = ca_map.expand_as(x)
+        ca_map = torch.sigmoid(self.eca_conv(x))
         x_ca = x * ca_map
 
         # --- GroupNorm ---
@@ -136,17 +132,17 @@ class SimAM(nn.Module):
 class Fusion1x1(nn.Module):
     def __init__(self, c):
         super().__init__()
-        self.fuse = nn.Conv2d(c * 2, c, kernel_size=1, bias=True)
-        self.act = nn.SiLU(inplace=True)
+        self.fuse = nn.Conv2d(c, c, kernel_size=1, bias=True)
+        self.act = nn.ReLU(inplace=True)
     def forward(self, x1, x2):
-        out = torch.cat([x1, x2], dim=1)
+        out = x1 + x2
         out = self.fuse(out)
         out = self.act(out)
         return out
 
 # --- 残差块结构 ---
 class SDWResidualBlock(nn.Module):
-    """SDWResidualBlock：残差块，包含两层轻量卷积、高频增强及统一注意力"""
+    """SDWResidualBlock：残差块，包含两层轻量卷积及 SimAM 注意力"""
     def __init__(self, channels, kernel_size=3, res_scale=1):
         super().__init__()
         self.res_scale = res_scale
@@ -154,25 +150,16 @@ class SDWResidualBlock(nn.Module):
 
         # 第一层保持3x3（局部特征）
         self.conv1 = SDWConv(channels, kernel_size=3)
-        # 第二层使用 dilated DWConv (5×5, dilation=2)
+        # 第二层使用普通 3x3 深度卷积
         self.conv2 = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=5, padding=2*2, dilation=2, groups=channels, bias=True),
-            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, dilation=1, groups=channels, bias=True),
+            nn.ReLU(inplace=True),
             nn.Conv2d(channels, channels, kernel_size=1, bias=True),
-            nn.SiLU(inplace=True)
+            nn.ReLU(inplace=True)
         )
 
-        self.att = ULAttentionPlus(channels)
-        self.proj_out = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-        self.alpha = nn.Parameter(torch.tensor(0.1))
-
-        # 创建固定拉普拉斯高频增强卷积核
-        lap_kernel = torch.tensor([[0, -1, 0],
-                                   [-1, 4, -1],
-                                   [0, -1, 0]], dtype=torch.float32)
-        self.register_buffer('lap_kernel', lap_kernel.unsqueeze(0).unsqueeze(0))
-        # 固定高频增强强度，稳定训练
-        self.hf_scale = 0.05  # 固定高频增强强度，稳定训练
+        # 仅使用 SimAM 空间注意力
+        self.att = SimAM()
 
     def forward(self, x):
         # 第一层轻量卷积
@@ -180,15 +167,10 @@ class SDWResidualBlock(nn.Module):
         # 第二层轻量卷积
         out = self.conv2(out)
 
-        # 高频增强
-        freq_out = F.conv2d(x, self.lap_kernel.repeat(x.size(1), 1, 1, 1), padding=1, groups=x.size(1))
-        out = out + self.hf_scale * freq_out
-
+        # SimAM 空间注意力
         out = out * self.res_scale
-
-        y_att = self.att(out)
-        y = self.proj_out(y_att)
-        return x + out + self.alpha * y
+        y = self.att(out)
+        return x + out + y
 
 
 # --- 主干网络 ---
@@ -229,8 +211,21 @@ class ULRNet(nn.Module):
         self.head = nn.Sequential(*m_head)
         # 删除原 self.body 定义
         # self.body = nn.Sequential(*m_body)
+        # 轻量 DW+PW+PixelShuffle 上采样
+        class PixelShuffleUpsample(nn.Module):
+            def __init__(self, c, scale):
+                super().__init__()
+                self.dw = nn.Conv2d(c, c, kernel_size=3, padding=1, groups=c, bias=True)
+                self.pw = nn.Conv2d(c, c * (scale ** 2), kernel_size=1, bias=True)
+                self.ps = nn.PixelShuffle(scale)
+            def forward(self, x):
+                x = self.dw(x)
+                x = self.pw(x)
+                x = self.ps(x)
+                return x
+
         self.tail = nn.Sequential(
-            common.Upsampler(conv, scale, n_feats, act=False),
+            PixelShuffleUpsample(n_feats, scale),
             conv(n_feats, args.n_colors, kernel_size)
         )
 
@@ -286,3 +281,34 @@ def check_modules(net):
 
     print('NAF blocks:', sum(isinstance(m, NAFBlock) for m in net.modules()))
     print('SDW blocks:', sum(isinstance(m, SDWResidualBlock) for m in net.modules()))
+
+
+# SCA 模块（官方论文实现）
+class SCA(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv(y)
+        y = torch.sigmoid(y)
+        return x * y
+
+
+# 新增 ECA 类 (2D版本)
+class ECA(nn.Module):
+    def __init__(self, channels, k_size=3):
+        super(ECA, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x: (batch, channels, height, width)
+        y = self.avg_pool(x)  # (batch, channels, 1, 1)
+        y = y.squeeze(-1).transpose(-1, -2)  # (batch, 1, channels)
+        y = self.conv(y)  # (batch, 1, channels)
+        y = self.sigmoid(y)  # (batch, 1, channels)
+        y = y.transpose(-1, -2).unsqueeze(-1)  # (batch, channels, 1, 1)
+        return x * y.expand_as(x)
