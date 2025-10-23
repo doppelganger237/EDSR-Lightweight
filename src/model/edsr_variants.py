@@ -16,7 +16,9 @@ from model import common
 
 # --- LayerNorm2d 替换 GroupNorm ---
 class LayerNorm2d(nn.Module):
-    """LayerNorm for Conv2d feature maps (B, C, H, W)"""
+    """LayerNorm for Conv2d feature maps (B, C, H, W)
+    实现对每个通道的归一化，保持空间维度不变，类似于通道层归一化。
+    """
     def __init__(self, c, eps=1e-6):
         super().__init__()
         self.eps = eps
@@ -162,7 +164,7 @@ class SDWResidualBlock(nn.Module):
 
         self.att = ULAttentionPlus(channels)
         self.proj_out = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-        self.alpha = nn.Parameter(torch.ones(channels, 1, 1) * 0.1)
+        self.alpha = nn.Parameter(torch.tensor(0.1))
 
         # 创建固定拉普拉斯高频增强卷积核
         lap_kernel = torch.tensor([[0, -1, 0],
@@ -186,8 +188,7 @@ class SDWResidualBlock(nn.Module):
 
         y_att = self.att(out)
         y = self.proj_out(y_att)
-        scaled_alpha = self.alpha
-        return x + out + scaled_alpha * y
+        return x + out + self.alpha * y
 
 
 # --- 主干网络 ---
@@ -221,15 +222,17 @@ class ULRNet(nn.Module):
             )
         m_body.append(conv(n_feats, n_feats, kernel_size))
 
-        # 网络尾部：上采样与颜色恢复
-        m_tail = [
-            common.Upsampler(conv, scale, n_feats, act=False),
-            conv(n_feats, args.n_colors, kernel_size)
-        ]
+        self.body_naf = nn.Sequential(*m_body[:n_resblocks // 2])
+        self.body_sdw = nn.Sequential(*m_body[n_resblocks // 2:-1])
+        self.body_tail = m_body[-1]
 
         self.head = nn.Sequential(*m_head)
-        self.body = nn.Sequential(*m_body)
-        self.tail = nn.Sequential(*m_tail)
+        # 删除原 self.body 定义
+        # self.body = nn.Sequential(*m_body)
+        self.tail = nn.Sequential(
+            common.Upsampler(conv, scale, n_feats, act=False),
+            conv(n_feats, args.n_colors, kernel_size)
+        )
 
     def forward(self, x):
         # 输入预处理：减均值
@@ -237,13 +240,11 @@ class ULRNet(nn.Module):
         # 浅层特征提取
         x = self.head(x)
 
-        # 分割 body 为前半段和后半段
-        n_resblocks = len([m for m in self.body if isinstance(m, (NAFBlock, SDWResidualBlock))])
-        half = n_resblocks // 2
-        naf_out = self.body[:half](x)
-        sdw_out = self.body[half:-1](naf_out)
+        naf_out = self.body_naf(x)
+        sdw_out = self.body_sdw(naf_out)
+        assert naf_out.shape == sdw_out.shape, f"Shape mismatch: {naf_out.shape} vs {sdw_out.shape}"
         fused = self.fusion(naf_out, sdw_out)
-        res = self.body[-1](fused)
+        res = self.body_tail(fused)
 
         # 残差连接
         res += x
