@@ -2,7 +2,7 @@ import torch.nn as nn
 
 import torch
 import torch.nn.functional as F
-
+from collections import OrderedDict
 
 def conv_layer(in_channels, out_channels, kernel_size, stride=1, dilation=1, groups=1):
     padding = int((kernel_size - 1) / 2) * dilation
@@ -106,16 +106,16 @@ class ESA(nn.Module):
         f = n_feats // 4
         self.conv1 = conv(n_feats, f, kernel_size=1)
         self.conv_f = conv(f, f, kernel_size=1)
-        self.conv_max = conv(f, f, kernel_size=3, padding=1)
-        self.conv2 = conv(f, f, kernel_size=3, stride=2, padding=0)
-        self.conv3 = conv(f, f, kernel_size=3, padding=1)
-        self.conv3_ = conv(f, f, kernel_size=3, padding=1)
+        self.conv_max = conv(f, f, kernel_size=3)
+        self.conv2 = conv(f, f, kernel_size=3, stride=2)
+        self.conv3 = conv(f, f, kernel_size=3)
+        self.conv3_ = conv(f, f, kernel_size=3)
         self.conv4 = conv(f, n_feats, kernel_size=1)
         self.sigmoid = nn.Sigmoid()
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        c1_ = (self.conv1(x))
+        c1_ = self.conv1(x)
         c1 = self.conv2(c1_)
         v_max = F.max_pool2d(c1, kernel_size=7, stride=3)
         v_range = self.relu(self.conv_max(v_max))
@@ -123,15 +123,16 @@ class ESA(nn.Module):
         c3 = self.conv3_(c3)
         c3 = F.interpolate(c3, (x.size(2), x.size(3)), mode='bilinear', align_corners=False) 
         cf = self.conv_f(c1_)
-        c4 = self.conv4(c3+cf)
+        c4 = self.conv4(c3 + cf)
         m = self.sigmoid(c4)
-        
         return x * m
 
 class CCA(nn.Module):
-    """Contrast-Aware Channel Attention (CCA) Module from RFDN"""
     def __init__(self, channel, reduction=4):
         super(CCA, self).__init__()
+
+        self.contrast = stdv_channels
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.conv_du = nn.Sequential(
             nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=True),
             nn.ReLU(inplace=True),
@@ -139,51 +140,116 @@ class CCA(nn.Module):
             nn.Sigmoid()
         )
 
+
     def forward(self, x):
-        # 对比敏感特征增强：同时利用均值和标准差
-        avg_out = torch.mean(x, dim=(2,3), keepdim=True)
-        std_out = torch.std(x, dim=(2,3), keepdim=True)
-        y = avg_out + std_out
+        y = self.contrast(x) + self.avg_pool(x)
         y = self.conv_du(y)
         return x * y
+    
+
+class CSR(nn.Module):
+    """Contrast-aware Spatial Refinement (CSR) Module"""
+    def __init__(self, channels, kernel_size=5):
+        super(CSR, self).__init__()
+        self.dw = nn.Conv2d(channels, channels, kernel_size, padding=kernel_size//2, groups=channels, bias=True)
+        self.pw = nn.Conv2d(channels, channels, 1, bias=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        att = self.sigmoid(self.pw(self.dw(x)))
+        return x * att + x
+
+class GLA(nn.Module):
+    """Global–Local Attention (融合全局通道与局部空间信息)"""
+    def __init__(self, channels, reduction=4, kernel_size=5):
+        super(GLA, self).__init__()
+        reduced_c = channels // reduction
+        # Global Channel Attention
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.global_conv = nn.Sequential(
+            nn.Conv2d(channels, reduced_c, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(reduced_c, channels, 1, bias=True),
+            nn.Sigmoid()
+        )
+        # Local Spatial Attention
+        self.local_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size, padding=kernel_size//2, groups=channels, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        g_att = self.global_conv(self.global_pool(x))
+        l_att = self.local_conv(x)
+        att = g_att * l_att
+        # Phase-Shifted Attention Enhancement
+        shift = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+        shift = torch.sigmoid(shift)
+        att = att + 0.5 * shift
+        return x * att + x
+
+
+class LSA(nn.Module):
+    """Local Spatial Attention (轻量空间注意力模块)"""
+    def __init__(self, channels, kernel_size=5):
+        super(LSA, self).__init__()
+        self.dwconv = nn.Conv2d(channels, channels, kernel_size, padding=kernel_size//2, groups=channels)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        att = self.sigmoid(self.dwconv(x))
+        return x * att + x
+
+
 
 
 class RFDB(nn.Module):
-    def __init__(self, in_channels, distillation_rate=0.25):
+    def __init__(self, in_channels):
         super(RFDB, self).__init__()
-        self.dc = self.distilled_channels = in_channels//2
+        self.dc = self.distilled_channels = in_channels // 2
         self.rc = self.remaining_channels = in_channels
         self.c1_d = conv_layer(in_channels, self.dc, 1)
-        self.c1_r = conv_layer(in_channels, self.rc, 3)
+        # DW+PW for c1_r
+        self.c1_r_dw = nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels, bias=True)
+        self.c1_r_pw = nn.Conv2d(in_channels, in_channels, 1, bias=True)
         self.c2_d = conv_layer(self.remaining_channels, self.dc, 1)
-        self.c2_r = conv_layer(self.remaining_channels, self.rc, 3)
+        self.c2_r_dw = nn.Conv2d(self.remaining_channels, self.remaining_channels, 3, padding=1, groups=self.remaining_channels, bias=True)
+        self.c2_r_pw = nn.Conv2d(self.remaining_channels, self.remaining_channels, 1, bias=True)
         self.c3_d = conv_layer(self.remaining_channels, self.dc, 1)
-        self.c3_r = conv_layer(self.remaining_channels, self.rc, 3)
-        self.c4 = conv_layer(self.remaining_channels, self.dc, 3)
+        self.c3_r_dw = nn.Conv2d(self.remaining_channels, self.remaining_channels, 3, padding=1, groups=self.remaining_channels, bias=True)
+        self.c3_r_pw = nn.Conv2d(self.remaining_channels, self.remaining_channels, 1, bias=True)
+        # DW+PW for c4
+        self.c4_dw = nn.Conv2d(self.remaining_channels, self.remaining_channels, 3, padding=1, groups=self.remaining_channels, bias=True)
+        self.c4_pw = nn.Conv2d(self.remaining_channels, self.dc, 1, bias=True)
         self.act = activation('lrelu', neg_slope=0.05)
-        self.c5 = conv_layer(self.dc*4, in_channels, 1)
-        self.cca = CCA(in_channels)
+        self.c5 = conv_layer(self.dc * 4, in_channels, 1)
+        self.gla = GLA(in_channels)
 
     def forward(self, input):
         distilled_c1 = self.act(self.c1_d(input))
-        r_c1 = (self.c1_r(input))
-        r_c1 = self.act(r_c1+input)
+        # c1_r: DW+PW
+        r_c1 = self.c1_r_dw(input)
+        r_c1 = self.c1_r_pw(r_c1)
+        r_c1 = self.act(r_c1 + input)
 
         distilled_c2 = self.act(self.c2_d(r_c1))
-        r_c2 = (self.c2_r(r_c1))
-        r_c2 = self.act(r_c2+r_c1)
+        r_c2 = self.c2_r_dw(r_c1)
+        r_c2 = self.c2_r_pw(r_c2)
+        r_c2 = self.act(r_c2 + r_c1)
 
         distilled_c3 = self.act(self.c3_d(r_c2))
-        r_c3 = (self.c3_r(r_c2))
-        r_c3 = self.act(r_c3+r_c2)
+        r_c3 = self.c3_r_dw(r_c2)
+        r_c3 = self.c3_r_pw(r_c3)
+        r_c3 = self.act(r_c3 + r_c2)
 
-        r_c4 = self.act(self.c4(r_c3))
+        r_c4 = self.c4_dw(r_c3)
+        r_c4 = self.c4_pw(r_c4)
+        r_c4 = self.act(r_c4)
 
         out = torch.cat([distilled_c1, distilled_c2, distilled_c3, r_c4], dim=1)
-        out_fused = self.cca(self.c5(out)) 
-
+        out_fused = self.c5(out)
+        out_fused = self.gla(out_fused)
         return out_fused
-
 
 
 def pixelshuffle_block(in_channels, out_channels, upscale_factor=2, kernel_size=3, stride=1):

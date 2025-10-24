@@ -17,7 +17,7 @@
 #python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96  --save sr_dwconv --n_threads 1 --use_dwconv --save_results --decay 40-80-120-160-200-240-280 --epochs 300
 
 # 训练 Full
-python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save sr_full --n_threads 1
+python main.py --model RFDN --scale 2 --patch_size 96 --save sr_full --n_threads 1 
 
 #python main.py --model TEST --scale 2 --patch_size 96 --save test --reset --n_threads 1 
 #python main.py --model EDSR --scale 2 --patch_size 96 --save test --reset --n_threads 1 

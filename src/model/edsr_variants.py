@@ -42,39 +42,78 @@ class CCA(nn.Module):
         att = self.fc(torch.cat([avg, var], dim=1))
         return x * att
 
+class DW_PW_Conv(nn.Module):
+    """
+    Depthwise followed by Pointwise convolution with SiLU activations.
+    DWConv -> SiLU -> PWConv -> SiLU
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, bias=True):
+        super(DW_PW_Conv, self).__init__()
+        self.dw_conv = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=padding, groups=in_channels, bias=bias)
+        self.act1 = nn.SiLU(inplace=True)
+        self.pw_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0, bias=bias)
+        self.act2 = nn.SiLU(inplace=True)
+    def forward(self, x):
+        x = self.dw_conv(x)
+        x = self.act1(x)
+        x = self.pw_conv(x)
+        x = self.act2(x)
+        return x
 
-class MSIRB(nn.Module):
-    def __init__(self, channels, act=nn.ReLU(inplace=True), ca=None, res_scale=1.0):
-        super().__init__()
+class MSDRB(nn.Module):
+    """
+    Multi-Stage Distillation Residual Block (轻量蒸馏版)
+    - 每层卷积后蒸馏出一部分特征
+    - 不再使用多尺度卷积
+    """
+    def __init__(self, channels, distill_rate=0.25, act=nn.SiLU(inplace=True), ca=None, res_scale=1.0):
+        super(MSDRB, self).__init__()
         self.res_scale = res_scale
-
-        # 块内多尺度 DW 卷积
-        self.dw3       = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=True)
-        self.dw3_d2    = nn.Conv2d(channels, channels, 3, padding=2, dilation=2, groups=channels, bias=True)
-        self.dw5       = nn.Conv2d(channels, channels, 5, padding=2, groups=channels, bias=True)
-
-        # PW 融合
-        self.pw = nn.Conv2d(channels, channels, 1, bias=True)
-
-        # 统一激活
+        self.ca = ca
         self.act = act
 
-        # 可选注意力
-        self.ca = ca
+        self.distilled_channels = int(channels * distill_rate)
+        self.remaining_channels = channels - self.distilled_channels
+
+        # 3 层逐步蒸馏结构，替换为 DW_PW_Conv
+        self.conv1 = DW_PW_Conv(channels, self.distilled_channels + self.remaining_channels)
+        self.conv2 = DW_PW_Conv(self.remaining_channels, self.distilled_channels + self.remaining_channels)
+        self.conv3 = DW_PW_Conv(self.remaining_channels, self.distilled_channels + self.remaining_channels)
+
+
+        # 聚合融合
+        self.fuse = nn.Sequential(
+            nn.Conv2d(self.distilled_channels * 3, channels, 1, bias=True),
+            nn.SiLU(inplace=True)
+        )
 
     def forward(self, x):
-        # 多尺度 DW 等权融合
-        out = (self.dw3(x) + self.dw3_d2(x) + self.dw5(x)) / 3.0
+        distilled_feats = []
+        out = x
 
-        # PW + 激活（统一一次）
-        out = self.act(self.pw(out))
+        # Stage 1
+        out = self.act(self.conv1(out))
+        d1, r1 = torch.split(out, [self.distilled_channels, self.remaining_channels], dim=1)
+        distilled_feats.append(d1)
 
-        # 注意力
+        # Stage 2
+        out = self.act(self.conv2(r1))
+        d2, r2 = torch.split(out, [self.distilled_channels, self.remaining_channels], dim=1)
+        distilled_feats.append(d2)
+
+        # Stage 3
+        out = self.act(self.conv3(r2))
+        d3, _ = torch.split(out, [self.distilled_channels, self.remaining_channels], dim=1)
+        distilled_feats.append(d3)
+
+        # 聚合蒸馏特征
+        out = torch.cat(distilled_feats, dim=1)
+        out = self.fuse(out)
+
         if self.ca is not None:
             out = self.ca(out)
 
         return x + out * self.res_scale
-
 class EDSR(nn.Module):
     def __init__(self, args, conv=common.default_conv):
         super(EDSR, self).__init__()
@@ -93,13 +132,14 @@ class EDSR(nn.Module):
         # 第一层卷积：把输入 RGB 图像（3通道）映射到 n_feats 个特征通道。
         m_head = [conv(args.n_colors, n_feats, kernel_size)]
 
-        # define body module
-        # 由一堆 残差块 ResBlock 组成（每个包含 2 个卷积+ReLU+残差连接）。
-        # 最后再加一个卷积。
-        m_body = []
-        for _ in range(n_resblocks):
-            m_body.append(MSIRB(n_feats, act=act, ca=CCA(n_feats, reduction=4), res_scale=args.res_scale))
-        m_body.append(conv(n_feats, n_feats, kernel_size))
+        # define body module (multi-stage feature aggregation)
+        # 用 msirb_blocks 保存每个 MSIRB 块
+        self.msirb_blocks = nn.ModuleList([
+            MSDRB(n_feats, act=act, ca=CCA(n_feats, reduction=4), res_scale=args.res_scale)
+            for _ in range(n_resblocks)
+        ])
+        # 融合卷积，将所有残差块输出特征聚合
+        self.fuse_conv = nn.Conv2d(n_feats * n_resblocks, n_feats, 1, bias=True)
 
         # define tail module
         # Upsampler：上采样模块（x2/x3/x4），用像素重排（pixel shuffle）实现。
@@ -110,20 +150,28 @@ class EDSR(nn.Module):
         ]
 
         self.head = nn.Sequential(*m_head)
-        self.body = nn.Sequential(*m_body)
         self.tail = nn.Sequential(*m_tail)
     # 输入图像 → 归一化 → 卷积映射 → 残差块堆叠 → 上采样 → 输出超分辨图像。
     def forward(self, x):
         x = self.sub_mean(x)
-        x = self.head(x)
+        x_head = self.head(x)
 
-        res = self.body(x)
-        res += x
+        # 多层特征聚合
+        res_feats = []
+        x = x_head
+        for block in self.msirb_blocks:
+            x = block(x)
+            res_feats.append(x)
+        # 拼接所有残差块输出
+        res_cat = torch.cat(res_feats, dim=1)
+        fused = self.fuse_conv(res_cat)
+        # 残差连接
+        res = fused + x_head
 
         x = self.tail(res)
         x = self.add_mean(x)
 
-        return x 
+        return x
     # 这是自定义的权重加载函数：
     # 如果权重维度匹配 → 正常加载
     # 如果不匹配且不是 tail 层 → 报错
