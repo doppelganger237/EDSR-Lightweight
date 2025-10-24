@@ -5,7 +5,6 @@
 # load_state_dict：能自动兼容不同放大倍数/通道数的预训练模型
 from model import common
 
-import torch
 import torch.nn as nn
 
 class ResBlock(nn.Module):
