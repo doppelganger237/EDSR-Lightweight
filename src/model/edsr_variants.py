@@ -23,15 +23,13 @@ class ECA(nn.Module):
         return x * y.expand_as(x)
 
 # ============================================================
-# MSIRB (Multi-Scale Interactive Residual Block)
-# （非门控多分支：DW 3x3 (d=1/2/3) 等权相加 → 1x1 → C/2→C + ECA）
+# MSIRB（基于你的最新设计）
 # ============================================================
 class MSIRB(nn.Module):
     def __init__(self, channels, res_scale=1.0):
         super(MSIRB, self).__init__()
         self.res_scale = res_scale
-
-        # 多尺度分支：3x3 深度卷积，d=1/2/3（CUDA 上更快更稳）
+        # 多尺度 DW 卷积分支
         self.dw_d1 = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=True),
             nn.SiLU(inplace=True)
@@ -40,45 +38,49 @@ class MSIRB(nn.Module):
             nn.Conv2d(channels, channels, 3, padding=2, dilation=2, groups=channels, bias=True),
             nn.SiLU(inplace=True)
         )
-        self.dw_d3 = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=3, dilation=3, groups=channels, bias=True),
+        self.dw_5x5 = nn.Sequential(
+            nn.Conv2d(channels, channels, 5, padding=2, groups=channels, bias=True),
             nn.SiLU(inplace=True)
         )
-
-        # 融合与瓶颈
-        self.fuse = nn.Conv2d(channels, channels, 1, bias=True)
-        self.reduce = nn.Conv2d(channels, channels // 2, 1, bias=True)
+        # 融合与瓶颈：C -> C/2 -> 3x3分组卷积 -> C
+        self.fuse    = nn.Conv2d(channels, channels, 1, bias=True)
+        self.reduce  = nn.Conv2d(channels, channels // 2, 1, bias=True)
+        self.mid_mix = nn.Conv2d(channels // 2, channels // 2, 3, padding=1, groups=4, bias=True)
         self.mid_act = nn.SiLU(inplace=True)
-        self.expand = nn.Conv2d(channels // 2, channels, 1, bias=True)
-
-        self.eca = ECA(channels, k_size=3)
+        self.expand  = nn.Conv2d(channels // 2, channels, 1, bias=True)
+        self.eca     = ECA(channels, k_size=3)
 
     def forward(self, x):
         a = self.dw_d1(x)
         b = self.dw_d2(x)
-        c = self.dw_d3(x)
-        out = (a + b + c) / 3.0                      # 等权相加（无可学习门控）
+        c = self.dw_5x5(x)
+        out = (a + b + c) / 3.0                     # 等权融合
         out = self.fuse(out)
-        out = self.expand(self.mid_act(self.reduce(out)))
+        out = self.reduce(out)
+        out = self.mid_act(self.mid_mix(out))
+        out = self.expand(out)
         out = self.eca(out)
         return x + out * self.res_scale
 
 # ============================================================
-# Shallow Fusion Group（级联残差 + 固定缩放）
+# Shallow Fusion Group
 # ============================================================
 class ShallowFusionGroup(nn.Module):
     def __init__(self, n_blocks, channels, group_res_scale=0.2):
         super(ShallowFusionGroup, self).__init__()
-        self.blocks = nn.ModuleList([MSIRB(channels, res_scale=1.0) for _ in range(n_blocks)])
-        self.fuse = nn.Conv2d(channels, channels, 1, bias=True)
+        self.blocks = nn.ModuleList([MSIRB(channels) for _ in range(n_blocks)])
+        # concat(C*n_blocks) -> C
+        self.cat_fuse = nn.Conv2d(channels * n_blocks, channels, 1, bias=True)
         self.group_res_scale = group_res_scale
 
     def forward(self, x):
         h = x
+        feats = []
         for blk in self.blocks:
             h = blk(h)
-        out = self.fuse(h)
-        return x + self.group_res_scale * out        # 固定缩放，非可学习
+            feats.append(h)
+        out = self.cat_fuse(torch.cat(feats, dim=1))
+        return x + self.group_res_scale * out
 
 # ============================================================
 # 主网络 ULRNet-MSIRB

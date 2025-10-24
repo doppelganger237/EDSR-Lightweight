@@ -20,6 +20,7 @@
 python main.py --model EDSR_VARIANTS --scale 2 --patch_size 96 --save sr_full --n_threads 0 --use_dwconv --use_attention --n_resblocks 16 --n_feats 64 
 
 #python main.py --model TEST --scale 2 --patch_size 96 --save test --reset --n_threads 1 
+#python main.py --model EDSR --scale 2 --patch_size 96 --save test --reset --n_threads 1 
 
 
 # 训练 RFDN FULL
