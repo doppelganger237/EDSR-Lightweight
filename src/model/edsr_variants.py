@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from model import common
 
-
-
 # ============================================================
 # ECA (Efficient Channel Attention)
 # ============================================================
@@ -24,58 +22,63 @@ class ECA(nn.Module):
         y = y.transpose(-1, -2).unsqueeze(-1)
         return x * y.expand_as(x)
 
-
 # ============================================================
 # MSIRB (Multi-Scale Interactive Residual Block)
+# （非门控多分支：DW 3x3 (d=1/2/3) 等权相加 → 1x1 → C/2→C + ECA）
 # ============================================================
 class MSIRB(nn.Module):
     def __init__(self, channels, res_scale=1.0):
         super(MSIRB, self).__init__()
         self.res_scale = res_scale
-        self.dw3 = nn.Sequential(
+
+        # 多尺度分支：3x3 深度卷积，d=1/2/3（CUDA 上更快更稳）
+        self.dw_d1 = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=True),
             nn.SiLU(inplace=True)
         )
-        self.dw7 = nn.Sequential(
-            nn.Conv2d(channels, channels, 7, padding=3, groups=channels, bias=True),
+        self.dw_d2 = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=2, dilation=2, groups=channels, bias=True),
             nn.SiLU(inplace=True)
         )
+        self.dw_d3 = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=3, dilation=3, groups=channels, bias=True),
+            nn.SiLU(inplace=True)
+        )
+
+        # 融合与瓶颈
         self.fuse = nn.Conv2d(channels, channels, 1, bias=True)
-        self.eca = ECA(channels, k_size=3)
         self.reduce = nn.Conv2d(channels, channels // 2, 1, bias=True)
+        self.mid_act = nn.SiLU(inplace=True)
         self.expand = nn.Conv2d(channels // 2, channels, 1, bias=True)
 
+        self.eca = ECA(channels, k_size=3)
+
     def forward(self, x):
-        a = self.dw3(x)
-        b = self.dw7(x)
-        a = a + 0.5 * b
-        b = b + 0.5 * a
-        out = a + b
+        a = self.dw_d1(x)
+        b = self.dw_d2(x)
+        c = self.dw_d3(x)
+        out = (a + b + c) / 3.0                      # 等权相加（无可学习门控）
         out = self.fuse(out)
-        out = self.reduce(out)
-        out = self.expand(out)
+        out = self.expand(self.mid_act(self.reduce(out)))
         out = self.eca(out)
         return x + out * self.res_scale
 
-
 # ============================================================
-# Shallow Fusion Group
+# Shallow Fusion Group（级联残差 + 固定缩放）
 # ============================================================
 class ShallowFusionGroup(nn.Module):
-    def __init__(self, n_blocks, channels):
+    def __init__(self, n_blocks, channels, group_res_scale=0.2):
         super(ShallowFusionGroup, self).__init__()
-        self.blocks = nn.Sequential(*[MSIRB(channels) for _ in range(n_blocks)])
+        self.blocks = nn.ModuleList([MSIRB(channels, res_scale=1.0) for _ in range(n_blocks)])
         self.fuse = nn.Conv2d(channels, channels, 1, bias=True)
+        self.group_res_scale = group_res_scale
 
     def forward(self, x):
-        residuals = []
+        h = x
         for blk in self.blocks:
-            x = blk(x)
-            residuals.append(x)
-        out = sum(residuals) / len(residuals)
-        out = self.fuse(out)
-        return out + x
-
+            h = blk(h)
+        out = self.fuse(h)
+        return x + self.group_res_scale * out        # 固定缩放，非可学习
 
 # ============================================================
 # 主网络 ULRNet-MSIRB
@@ -94,15 +97,15 @@ class ULRNet(nn.Module):
         # head
         self.head = nn.Conv2d(args.n_colors, n_feats, 3, padding=1, bias=True)
 
-        # body（使用 MSIRB + Shallow Fusion）
+        # body（多个组，每组含3个 MSIRB）
         body = []
         num_groups = max(1, n_resblocks // 3)
         for _ in range(num_groups):
-            body.append(ShallowFusionGroup(3, n_feats))
+            body.append(ShallowFusionGroup(3, n_feats, group_res_scale=0.2))
         body.append(conv(n_feats, n_feats, 3))
         self.body = nn.Sequential(*body)
 
-        # tail
+        # tail（与 EDSR 一致，利于 PSNR）
         self.tail = nn.Sequential(
             common.Upsampler(conv, scale, n_feats, act=False),
             conv(n_feats, args.n_colors, 3)
@@ -117,9 +120,8 @@ class ULRNet(nn.Module):
         x = self.add_mean(x)
         return x
 
-
 def make_model(args, parent=False):
     net = ULRNet(args)
     params = sum(p.numel() for p in net.parameters())
-    print(f"Params: {params/1e3:.1f}K (MSIRB + Shallow Fusion)")
+    print(f"Params: {params/1e3:.1f}K (MSIRB-dilated + RIR Group)")
     return net
