@@ -19,7 +19,7 @@
 # 训练 Full
 python main.py --model BFFN --scale 2 --patch_size 96 --save bffn --n_threads 0 --lr 5e-4
 #python main.py --model rfdn --scale 2 --patch_size 96 --save rfdn --n_threads 0 --lr 5e-4
-
+#python main.py --model span --scale 2 --patch_size 96 --save span --n_threads 0 --lr 5e-4 --batch_size 64
 #python main.py --model TEST --scale 2 --patch_size 96 --save test --reset --n_threads 1 
 #python main.py --model EDSR --scale 2 --patch_size 96 --save test --reset --n_threads 1 
 

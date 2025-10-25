@@ -319,7 +319,7 @@ class CCA(nn.Module):
 #         out_fused = self.gla(out_fused)
 #         return out_fused
 
-class RLFB(nn.Module):
+class BFFB(nn.Module):
     """
     Residual Local Feature Block (RLFB).
     """
@@ -329,7 +329,7 @@ class RLFB(nn.Module):
                  mid_channels=None,
                  out_channels=None,
                  esa_channels=16):
-        super(RLFB, self).__init__()
+        super(BFFB, self).__init__()
 
         if mid_channels is None:
             mid_channels = in_channels
@@ -343,11 +343,12 @@ class RLFB(nn.Module):
         # 第三层保留标准Conv，保持通道融合能力
         self.c3_r = nn.Conv2d(in_channels, in_channels, 3, padding=1, bias=True)
 
+        #self.c3_r = BSConv(in_channels, in_channels, kernel_size=3)
+
         self.c5 = conv_layer(in_channels, out_channels, 1)
         
-        self.cca = CCA(out_channels)
+        self.cca = CCA(out_channels, reduction=4)
         self.esa = MESA(esa_channels, out_channels, nn.Conv2d)
-
         #self.act = activation('lrelu', neg_slope=0.05)
         self.act = activation('gelu')
 

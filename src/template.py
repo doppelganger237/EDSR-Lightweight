@@ -51,3 +51,10 @@ def set_template(args):
         args.patch_size = 41
         args.lr = 1e-1
 
+
+    if args.template.find('BFFN') >= 0:
+        args.model = 'BFFN'
+        args.n_resblocks = 8
+        args.n_feats = 64
+        args.lr = 5e-1
+        args.batch_size = 64

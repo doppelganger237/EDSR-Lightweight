@@ -18,7 +18,7 @@ class BFFN(nn.Module):
         self.feature_extraction = B.BSConv(in_channels, num_features, kernel_size=3)
 
         # 多个轻量特征块（RLFB变体）
-        self.blocks = nn.ModuleList([B.RLFB(in_channels=num_features) for _ in range(num_resblocks)])
+        self.blocks = nn.ModuleList([B.BFFB(in_channels=num_features) for _ in range(num_resblocks)])
 
         # 通道拼接与融合：整合多块 RLFB 输出的通道信息
         self.fusion_conv = B.conv_block(num_features * num_resblocks, num_features, kernel_size=1, act_type='gelu')
@@ -55,5 +55,9 @@ class BFFN(nn.Module):
 
 
 def check_modules(net):
-    params = sum(p.numel() for p in net.parameters())
-    print(f"Params: {params/1e3:.1f}K")
+   # params = sum(p.numel() for p in net.parameters())
+
+    from fvcore.nn import FlopCountAnalysis, flop_count_table
+    print(flop_count_table(FlopCountAnalysis(net, inputs = (torch.rand(1, 3, 256, 256),))))
+
+    #print(f"Params: {params/1e3:.1f}K")
