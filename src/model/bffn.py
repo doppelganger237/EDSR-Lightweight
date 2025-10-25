@@ -5,7 +5,7 @@ from model import block as B
 
 def make_model(args, parent=False):
     model = BFFN(args)
-    check_modules(model)
+    #check_modules(model)
     return model
 
 
