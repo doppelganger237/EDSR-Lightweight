@@ -77,3 +77,5 @@ paper/
 
 # macOS system files
 .DS_Store
+
+test.sh
