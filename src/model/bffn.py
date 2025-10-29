@@ -26,7 +26,7 @@ class BFFN(nn.Module):
         self.blocks = nn.ModuleList([B.BFFB(in_channels=num_features) for _ in range(num_resblocks)])
 
         # 通道拼接与融合：整合多块 RLFB 输出的通道信息
-        self.fusion_conv = B.conv_block(num_features * num_resblocks, num_features, kernel_size=1, act_type='gelu')
+        #self.fusion_conv = B.conv_block(num_features * num_resblocks, num_features, kernel_size=1, act_type='gelu')
 
         # 特征细化模块：对融合后的特征进行卷积增强，并与浅层特征做残差连接
         self.refine_conv = nn.Sequential(
@@ -37,21 +37,16 @@ class BFFN(nn.Module):
         self.upsampler = B.pixelshuffle_block(num_features, out_channels, upscale_factor=upscale_factor)
 
     def forward(self, x):
-        # 提取初始特征
+        # 浅层特征提取
         shallow_features = self.feature_extraction(x)
 
-        # 多块串联提取特征，同时保存输出以用于融合
+        # 多块串联，每块输出作为下一块输入
         features = shallow_features
-        block_features = []
         for blk in self.blocks:
-            features = blk(features)
-            block_features.append(features)
+            features = blk(features)  # 串联，每块输入是上一块输出
 
-        # 通道维度拼接所有 block 输出并融合
-        fused_features = self.fusion_conv(torch.cat(block_features, dim=1))
-
-        # 特征细化 + 残差增强
-        refined_features = self.refine_conv(fused_features) + shallow_features
+        # 特征细化 + 残差
+        refined_features = self.refine_conv(features) + shallow_features
 
         # 上采样得到最终高分辨率图像
         sr_output = self.upsampler(refined_features)
