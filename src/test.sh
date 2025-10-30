@@ -3,7 +3,7 @@
 #python main.py --model BFFN --data_test Set5+Set14+B100+Urban100 --scale 2 --pre_train ../experiment/bffn_ghost/model/model_best.pt --test_only --self_ensemble --n_threads 0
 
 
-python main.py --model BFFN --data_test Set5+Set14+B100+Urban100 --scale 2 --pre_train ../experiment/bffn_ghost/model/model_best.pt --test_only --n_threads 0
+#python main.py --model BFFN --data_test Set5+Set14+B100+Urban100 --scale 2 --pre_train ../experiment/bffn_ghost/model/model_best.pt --test_only --n_threads 0
 
 # 训练部分
 
@@ -13,7 +13,7 @@ python main.py --model BFFN --data_test Set5+Set14+B100+Urban100 --scale 2 --pre
 
 
 
-#python main.py --model BFFN --scale 2 --patch_size 128 --save bffn_128 --load bffn_128 --n_threads 0 --lr 5e-4 --n_resblocks 8 --resume -1
+python main.py --model BFFN --scale 2 --patch_size 96 --save test --n_threads 0 --lr 5e-4 --n_resblocks 8
 
 
 #python main.py --model BFFN --data_test Set5+Set14+B100+Urban100 --scale 2 --n_resblocks 6 --pre_train ../experiment/bffn_res6/model/model_best.pt --test_only --n_threads 0

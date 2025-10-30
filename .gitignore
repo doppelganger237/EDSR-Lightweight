@@ -74,8 +74,3 @@ dataset/
 notes/
 results/
 paper/
-
-# macOS system files
-.DS_Store
-
-src/test.sh
