@@ -227,98 +227,6 @@ class CCA(nn.Module):
         return x * y
     
 
-# class CSR(nn.Module):
-#     """Contrast-aware Spatial Refinement (CSR) Module"""
-#     def __init__(self, channels, kernel_size=5):
-#         super(CSR, self).__init__()
-#         self.dw = nn.Conv2d(channels, channels, kernel_size, padding=kernel_size//2, groups=channels, bias=True)
-#         self.pw = nn.Conv2d(channels, channels, 1, bias=True)
-#         self.sigmoid = nn.Sigmoid()
-
-#     def forward(self, x):
-#         att = self.sigmoid(self.pw(self.dw(x)))
-#         return x * att + x
-
-# class GLA(nn.Module):
-#     """Global–Local Attention (融合全局通道与局部空间信息)"""
-#     def __init__(self, channels, reduction=4, kernel_size=5):
-#         super(GLA, self).__init__()
-#         reduced_c = channels // reduction
-#         # Global Channel Attention
-#         self.global_pool = nn.AdaptiveAvgPool2d(1)
-#         self.global_conv = nn.Sequential(
-#             nn.Conv2d(channels, reduced_c, 1, bias=True),
-#             nn.ReLU(inplace=True),
-#             nn.Conv2d(reduced_c, channels, 1, bias=True),
-#             nn.Sigmoid()
-#         )
-#         # Local Spatial Attention
-#         self.local_conv = nn.Sequential(
-#             nn.Conv2d(channels, channels, kernel_size, padding=kernel_size//2, groups=channels, bias=True),
-#             nn.Sigmoid()
-#         )
-
-#     def forward(self, x):
-#         g_att = self.global_conv(self.global_pool(x))
-#         l_att = self.local_conv(x)
-#         att = g_att * l_att
-#         # Phase-Shifted Attention Enhancement
-#         shift = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
-#         shift = torch.sigmoid(shift)
-#         att = att + 0.5 * shift
-#         return x * att + x
-
-
-
-
-
-# class RFDB(nn.Module):
-#     def __init__(self, in_channels):
-#         super(RFDB, self).__init__()
-#         self.dc = self.distilled_channels = in_channels // 2
-#         self.rc = self.remaining_channels = in_channels
-#         self.c1_d = conv_layer(in_channels, self.dc, 1)
-#         # DW+PW for c1_r
-#         self.c1_r_dw = nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels, bias=True)
-#         self.c1_r_pw = nn.Conv2d(in_channels, in_channels, 1, bias=True)
-#         self.c2_d = conv_layer(self.remaining_channels, self.dc, 1)
-#         self.c2_r_dw = nn.Conv2d(self.remaining_channels, self.remaining_channels, 3, padding=1, groups=self.remaining_channels, bias=True)
-#         self.c2_r_pw = nn.Conv2d(self.remaining_channels, self.remaining_channels, 1, bias=True)
-#         self.c3_d = conv_layer(self.remaining_channels, self.dc, 1)
-#         self.c3_r_dw = nn.Conv2d(self.remaining_channels, self.remaining_channels, 3, padding=1, groups=self.remaining_channels, bias=True)
-#         self.c3_r_pw = nn.Conv2d(self.remaining_channels, self.remaining_channels, 1, bias=True)
-#         # DW+PW for c4
-#         self.c4_dw = nn.Conv2d(self.remaining_channels, self.remaining_channels, 3, padding=1, groups=self.remaining_channels, bias=True)
-#         self.c4_pw = nn.Conv2d(self.remaining_channels, self.dc, 1, bias=True)
-#         self.act = activation('lrelu', neg_slope=0.05)
-#         self.c5 = conv_layer(self.dc * 4, in_channels, 1)
-#         self.gla = GLA(in_channels)
-
-#     def forward(self, input):
-#         distilled_c1 = self.act(self.c1_d(input))
-#         # c1_r: DW+PW
-#         r_c1 = self.c1_r_dw(input)
-#         r_c1 = self.c1_r_pw(r_c1)
-#         r_c1 = self.act(r_c1 + input)
-
-#         distilled_c2 = self.act(self.c2_d(r_c1))
-#         r_c2 = self.c2_r_dw(r_c1)
-#         r_c2 = self.c2_r_pw(r_c2)
-#         r_c2 = self.act(r_c2 + r_c1)
-
-#         distilled_c3 = self.act(self.c3_d(r_c2))
-#         r_c3 = self.c3_r_dw(r_c2)
-#         r_c3 = self.c3_r_pw(r_c3)
-#         r_c3 = self.act(r_c3 + r_c2)
-
-#         r_c4 = self.c4_dw(r_c3)
-#         r_c4 = self.c4_pw(r_c4)
-#         r_c4 = self.act(r_c4)
-
-#         out = torch.cat([distilled_c1, distilled_c2, distilled_c3, r_c4], dim=1)
-#         out_fused = self.c5(out)
-#         out_fused = self.gla(out_fused)
-#         return out_fused
 
 class BFFB(nn.Module):
     """
@@ -343,6 +251,8 @@ class BFFB(nn.Module):
 
         # 第三层GhostConv
         self.c3_r = GhostConv(in_channels, in_channels, kernel_size=3, ratio=0.5, stride=1, bias=True)
+
+        
 
         # Conv1
         self.c4 = conv_layer(in_channels, out_channels, 1)

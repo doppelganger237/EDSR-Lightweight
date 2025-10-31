@@ -195,11 +195,10 @@ class SPAN(nn.Module):
     """
 
     def __init__(self,
-                 args,
-                 num_in_ch = 3,
-                 num_out_ch = 3,
+                 num_in_ch,
+                 num_out_ch,
                  feature_channels=48,
-                 upscale=2,
+                 upscale=4,
                  bias=True,
                  img_range=255.,
                  rgb_mean=(0.4488, 0.4371, 0.4040)
@@ -208,7 +207,6 @@ class SPAN(nn.Module):
 
         in_channels = num_in_ch
         out_channels = num_out_ch
-        
         self.img_range = img_range
         self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
 
@@ -245,23 +243,18 @@ class SPAN(nn.Module):
 
         return output
 
+def make_model(args, parent=False):
+    model = SPAN(num_in_ch=3,
+                 num_out_ch=3,
+                 upscale=args.scale[0],
+                 feature_channels=48)
+    return model
+
 if __name__ == "__main__":
     from fvcore.nn import FlopCountAnalysis, flop_count_table
     import time
-    #model = SPAN(3, 3, upscale=2, feature_channels=48).cuda()
-
     model = SPAN(3, 3, upscale=2, feature_channels=48)
-    
     model.eval()
-    
     inputs = (torch.rand(1, 3, 256, 256),)
     print(flop_count_table(FlopCountAnalysis(model, inputs)))
 
-def make_model(args, parent=False):
-    net = SPAN(args)
-    params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    print(f"Params: {params/1e3:.1f}K")
-
-    from fvcore.nn import FlopCountAnalysis, flop_count_table
-    print(flop_count_table(FlopCountAnalysis(net, inputs = (torch.rand(1, 3, 256, 256),))))
-    return net
