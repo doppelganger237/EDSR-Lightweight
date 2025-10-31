@@ -298,30 +298,22 @@ class BFFB(nn.Module):
             weight_only=False
         )
 
-        # self.c3_r = OREPA(
-        #     in_channels=mid_channels,
-        #     out_channels=out_channels,
-        #     kernel_size=3,
-        #     padding=1,   # ✅ 一定要加
-        #     deploy=deploy,
-        #     nonlinear=None,
-        #     weight_only=False
-        # )
-        
-        self.c3_r = OREPA_1x1(
+        self.c3_r = OREPA(
             in_channels=mid_channels,
             out_channels=out_channels,
-            kernel_size=1,
-            padding=0,   # ✅ 一定要加
+            kernel_size=3,
+            padding=1,   # ✅ 一定要加
             deploy=deploy,
             nonlinear=None,
+            weight_only=False
         )
-        # Conv1
+        
+
         self.fuse = conv_layer(in_channels, out_channels, 1)
         
         self.esa = ESA(esa_channels, out_channels, nn.Conv2d)
-        #self.cca = CCA(out_channels, reduction=4)
-        self.act = activation('silu')
+        self.cca = CCA(out_channels, reduction=4)
+        self.act = activation('lrelu')
 
     def forward(self, x):
         out = self.c1_r(x)
@@ -337,6 +329,8 @@ class BFFB(nn.Module):
         out = self.fuse(out)
 
         out = self.esa(out)
+
+        out=self.cca(out)
 
 
         return out
@@ -381,6 +375,7 @@ class BFFN(nn.Module):
             nonlinear=None,
             weight_only=False
         )
+
         
         # 上采样模块：使用 PixelShuffle 实现分辨率提升
         self.upsampler = pixelshuffle_block(num_features, out_channels, upscale_factor=upscale_factor)
