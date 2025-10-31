@@ -268,7 +268,7 @@ class BFFB(nn.Module):
         out = self.act(out)
 
         out = (self.c2_r(out))
-        out = self.act(out)
+        # out = self.act(out)
 
         #out = (self.c3_r(out))
         #out = self.act(out)
