@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from collections import OrderedDict
-#from model.ghost import GhostModule as GhostConv
 
 def conv_layer(in_channels, out_channels, kernel_size, stride=1, dilation=1, groups=1):
     padding = int((kernel_size - 1) / 2) * dilation
@@ -31,7 +30,6 @@ class BSConvU(nn.Module):
         return self.dw(self.pw(x))
 
 
-
 # Alias: BSConv = BSConvU
 class BSConv(BSConvU):
     """
@@ -41,6 +39,73 @@ class BSConv(BSConvU):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=None, bias=True):
         super(BSConv, self).__init__(in_channels, out_channels, kernel_size, stride, padding, bias)
     
+
+# Reparameterization: (3*3) U (3*1) U (1*3) U (1*1) U (identity) -> (3*3)
+class RepBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, deploy=False):
+        super(RepBlock, self).__init__()
+        self.deploy = deploy
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.activation = activation('lrelu')
+
+        if deploy:
+            self.rbr_reparam = nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
+                                         kernel_size=(3, 3), stride=1,
+                                         padding=1, dilation=1, groups=1, bias=True,
+                                         padding_mode='zeros')
+        else:
+            self.rbr_3x3_branch = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=(3, 3),
+                                            stride=1, padding=1, dilation=1, groups=1, padding_mode='zeros')
+            self.rbr_3x1_branch = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=(3, 1),
+                                            stride=1, padding=(1, 0), dilation=1, groups=1, padding_mode='zeros')
+            self.rbr_1x3_branch = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=(1, 3),
+                                            stride=1, padding=(0, 1), dilation=1, groups=1, padding_mode='zeros')
+            self.rbr_1x1_branch = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=(1, 1),
+                                            stride=1, padding=(0, 0), dilation=1, groups=1, padding_mode='zeros')
+
+    def forward(self, inputs):
+        if self.deploy:
+            return self.activation(self.rbr_reparam(inputs))
+        else:
+            return self.activation( (self.rbr_3x3_branch(inputs)) +
+                                   (self.rbr_3x1_branch(inputs) + self.rbr_1x3_branch(inputs) + self.rbr_1x1_branch(inputs)) +
+                                   (inputs) )
+
+    def switch_to_deploy(self):
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.rbr_reparam = nn.Conv2d(in_channels=self.in_channels, out_channels=self.out_channels, kernel_size=3,
+                                     stride=1, padding=1, dilation=1, groups=1, bias=True, padding_mode='zeros')
+        self.rbr_reparam.weight.data = kernel
+        self.rbr_reparam.bias.data = bias
+        self.__delattr__('rbr_3x3_branch')
+        self.__delattr__('rbr_3x1_branch')
+        self.__delattr__('rbr_1x3_branch')
+        self.__delattr__('rbr_1x1_branch')
+        self.deploy = True
+
+    def get_equivalent_kernel_bias(self):
+        # 3x3 branch
+        kernel_3x3, bias_3x3 = self.rbr_3x3_branch.weight.data, self.rbr_3x3_branch.bias.data
+        # 1x1 1x3 3x1 branch
+        kernel_1x1_1x3_3x1_fuse, bias_1x1_1x3_3x1_fuse = self._fuse_1x1_1x3_3x1_branch(self.rbr_1x1_branch,
+                                                                                       self.rbr_1x3_branch,
+                                                                                       self.rbr_3x1_branch)
+        # identity branch
+        device = kernel_1x1_1x3_3x1_fuse.device  # just for getting the device
+        kernel_identity = torch.zeros(self.out_channels, self.in_channels, 3, 3, device=device)
+        for i in range(self.out_channels):
+            kernel_identity[i, i, 1, 1] = 1.0
+
+        return kernel_3x3 + kernel_1x1_1x3_3x1_fuse + kernel_identity, \
+               bias_3x3 + bias_1x1_1x3_3x1_fuse
+
+
+    def _fuse_1x1_1x3_3x1_branch(self, conv1, conv2, conv3):
+        weight = F.pad(conv1.weight.data, (1, 1, 1, 1)) + F.pad(conv2.weight.data, (0, 0, 1, 1)) + F.pad(
+            conv3.weight.data, (1, 1, 0, 0))
+        bias = conv1.bias.data + conv2.bias.data + conv3.bias.data
+        return weight, bias
 
 
 def norm(norm_type, nc):
@@ -101,15 +166,6 @@ def activation(act_type, inplace=True, neg_slope=0.05, n_prelu=1):
     return layer
 
 
-class ShortcutBlock(nn.Module):
-    def __init__(self, submodule):
-        super(ShortcutBlock, self).__init__()
-        self.sub = submodule
-
-    def forward(self, x):
-        output = x + self.sub(x)
-        return output
-
 def mean_channels(F):
     assert(F.dim() == 4)
     spatial_sum = F.sum(3, keepdim=True).sum(2, keepdim=True)
@@ -141,40 +197,6 @@ def pixelshuffle_block(in_channels, out_channels, upscale_factor=2, kernel_size=
     return sequential(conv, pixel_shuffle)
 
 
-# class ESA(nn.Module):
-#     def __init__(self, n_feats, conv):
-#         super(ESA, self).__init__()
-#         f = n_feats // 4
-#         self.conv1 = conv(n_feats, f, kernel_size=1)
-#         self.conv_f = conv(f, f, kernel_size=1)
-#         self.conv_max = conv(f, f, kernel_size=3)
-#         self.conv2 = conv(f, f, kernel_size=3, stride=2)
-#         self.conv3 = conv(f, f, kernel_size=3)
-#         self.conv3_ = conv(f, f, kernel_size=3)
-#         self.conv4 = conv(f, n_feats, kernel_size=1)
-#         self.sigmoid = nn.Sigmoid()
-#         self.relu = nn.ReLU(inplace=True)
-
-#     def forward(self, x):
-#         c1_ = self.conv1(x)
-#         c1 = self.conv2(c1_)
-#         v_max = F.max_pool2d(c1, kernel_size=7, stride=3)
-#         v_range = self.relu(self.conv_max(v_max))
-#         c3 = self.relu(self.conv3(v_range))
-#         c3 = self.conv3_(c3)
-#         c3 = F.interpolate(c3, (x.size(2), x.size(3)), mode='bilinear', align_corners=False) 
-#         cf = self.conv_f(c1_)
-#         c4 = self.conv4(c3 + cf)
-#         m = self.sigmoid(c4)
-#         return x * m
-    
-# class ECA(nn.Module):
-#     """Efficient Channel Attention (轻量通道注意力)"""
-#     def __init__(self, channels, k_size=3):
-#         super(ECA, self).__init__()
-#         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-#         self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
-#         self.sigmoid = nn.Sigmoid()
         
 class ESA(nn.Module):
     """
@@ -247,15 +269,8 @@ class BFFB(nn.Module):
 
         # 前两层使用BSConv（先1x1再DWConv，保持与BSConvU一致）
         self.c1_r = BSConv(in_channels, in_channels, kernel_size=3)
-        #self.c2_r = BSConv(in_channels, in_channels, kernel_size=3)
-        self.c2_r = conv_layer(in_channels, in_channels, kernel_size=3)
+        self.c2_r = RepBlock(in_channels, in_channels, act_type='gelu', deploy=False)
         self.c3_r = BSConv(in_channels, in_channels, kernel_size=3)
-
-        #self.c1_r = GhostConv(in_channels, in_channels, kernel_size=3, ratio=0.5, stride=1, bias=True)
-        #self.c2_r = GhostConv(in_channels, in_channels, kernel_size=3, ratio=0.5, stride=1, bias=True)
-        # 第三层GhostConv
-        #self.c3_r = GhostConv(in_channels, in_channels, kernel_size=3, ratio=0.5, stride=1, bias=True)
-
         
 
         # Conv1
@@ -266,13 +281,13 @@ class BFFB(nn.Module):
         self.act = activation('gelu')
 
     def forward(self, x):
-        out = (self.c1_r(x))
+        out = self.c1_r(x)
         out = self.act(out)
 
-        out = (self.c2_r(out))
+        out = self.c2_r(out)
         out = self.act(out)
 
-        out = (self.c3_r(out))
+        out = self.c3_r(out)
         out = self.act(out)
 
         out = out + x
@@ -282,5 +297,3 @@ class BFFB(nn.Module):
 
 
         return out
-
-
