@@ -3,15 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import OrderedDict
 from model.OREPA import OREPA
-from model.OREPA import OREPA_1x1
-from model.eecnet import EEC
-from model.edbb import EDBB 
 
 def conv_layer(in_channels, out_channels, kernel_size, stride=1, dilation=1, groups=1):
     padding = int((kernel_size - 1) / 2) * dilation
     return nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=padding, bias=True, dilation=dilation,
                      groups=groups)
-
 
 class BSConvU(nn.Module):
     """Blueprint Separable Convolution (Unshared)
@@ -294,8 +290,6 @@ class BFFB(nn.Module):
             kernel_size=3,
             padding=1,   # ✅ 一定要加
             deploy=deploy,
-            nonlinear=None,
-            weight_only=False
         )
 
         self.c3_r = OREPA(
@@ -304,16 +298,15 @@ class BFFB(nn.Module):
             kernel_size=3,
             padding=1,   # ✅ 一定要加
             deploy=deploy,
-            nonlinear=None,
-            weight_only=False
         )
         
 
         self.fuse = conv_layer(in_channels, out_channels, 1)
+
         
         self.esa = ESA(esa_channels, out_channels, nn.Conv2d)
-        self.cca = CCA(out_channels, reduction=4)
-        self.act = activation('lrelu')
+        #self.cca = CCA(out_channels, reduction=4)
+        self.act = activation('gelu')
 
     def forward(self, x):
         out = self.c1_r(x)
@@ -330,7 +323,7 @@ class BFFB(nn.Module):
 
         out = self.esa(out)
 
-        out=self.cca(out)
+        #out=self.cca(out)
 
 
         return out
@@ -366,16 +359,17 @@ class BFFN(nn.Module):
         # 特征细化模块：对融合后的特征进行卷积增强，并与浅层特征做残差连接
         #self.refine_conv = conv_layer(num_features, num_features, kernel_size=3)
 
-        self.refine_conv = OREPA(
-            in_channels=num_features,
-            out_channels=num_features,
-            kernel_size=3,
-            padding=1,   # ✅ 一定要加
-            deploy=deploy,
-            nonlinear=None,
-            weight_only=False
-        )
-
+        # self.refine_conv = OREPA(
+        #     in_channels=num_features,
+        #     out_channels=num_features,
+        #     kernel_size=3,
+        #     padding=1,   # ✅ 一定要加
+        #     deploy=deploy,
+        #     nonlinear=None,
+        #     weight_only=False
+        # )
+        
+        self.refine_conv = BSConv(num_features, num_features, kernel_size=3)
         
         # 上采样模块：使用 PixelShuffle 实现分辨率提升
         self.upsampler = pixelshuffle_block(num_features, out_channels, upscale_factor=upscale_factor)
