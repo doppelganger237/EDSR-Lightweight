@@ -265,8 +265,9 @@ class BFFB(nn.Module):
                  in_channels,
                  mid_channels=None,
                  out_channels=None,
-                 esa_channels=16, 
-                 deploy=False):
+                 esa_channels=16,
+                 deploy=False,
+                 use_esa=True):
         super(BFFB, self).__init__()
 
         if mid_channels is None:
@@ -274,6 +275,7 @@ class BFFB(nn.Module):
         if out_channels is None:
             out_channels = in_channels
 
+        self.use_esa = use_esa
 
         self.c1_r = OREPA(
             in_channels=in_channels,
@@ -299,12 +301,11 @@ class BFFB(nn.Module):
             padding=1,   # ✅ 一定要加
             deploy=deploy,
         )
-        
 
         self.fuse = conv_layer(in_channels, out_channels, 1)
 
-        
-        self.esa = ESA(esa_channels, out_channels, nn.Conv2d)
+        if self.use_esa:
+            self.esa = ESA(esa_channels, out_channels, nn.Conv2d)
         #self.cca = CCA(out_channels, reduction=4)
         self.act = activation('gelu')
 
@@ -321,10 +322,9 @@ class BFFB(nn.Module):
         out = out + x
         out = self.fuse(out)
 
-        out = self.esa(out)
-
+        if self.use_esa:
+            out = self.esa(out)
         #out=self.cca(out)
-
 
         return out
 
@@ -353,23 +353,25 @@ class BFFN(nn.Module):
         )
 
         # 多个轻量特征块（RLFB变体）
-        self.blocks = nn.ModuleList([BFFB(in_channels=num_features) for _ in range(num_resblocks)])
+        self.blocks = nn.ModuleList([
+            BFFB(in_channels=num_features, use_esa=(i % 2 == 0))  # 偶数块使用 ESA
+            for i in range(num_resblocks)
+        ])
 
        #self.post_blocks_conv1 = BSConv(num_features, num_features, kernel_size=1)
         # 特征细化模块：对融合后的特征进行卷积增强，并与浅层特征做残差连接
         #self.refine_conv = conv_layer(num_features, num_features, kernel_size=3)
 
-        # self.refine_conv = OREPA(
-        #     in_channels=num_features,
-        #     out_channels=num_features,
-        #     kernel_size=3,
-        #     padding=1,   # ✅ 一定要加
-        #     deploy=deploy,
-        #     nonlinear=None,
-        #     weight_only=False
-        # )
-        
-        self.refine_conv = BSConv(num_features, num_features, kernel_size=3)
+        self.refine_conv = OREPA(
+            in_channels=num_features,
+            out_channels=num_features,
+            kernel_size=3,
+            padding=1,   # ✅ 一定要加
+            deploy=deploy,
+            nonlinear=None,
+            weight_only=False
+        )
+
         
         # 上采样模块：使用 PixelShuffle 实现分辨率提升
         self.upsampler = pixelshuffle_block(num_features, out_channels, upscale_factor=upscale_factor)
