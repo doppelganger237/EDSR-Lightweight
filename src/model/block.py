@@ -176,7 +176,7 @@ def pixelshuffle_block(in_channels, out_channels, upscale_factor=2, kernel_size=
 #         self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
 #         self.sigmoid = nn.Sigmoid()
         
-class MESA(nn.Module):
+class ESA(nn.Module):
     """
     Modification of Enhanced Spatial Attention (ESA), which is proposed by 
     `Residual Feature Aggregation Network for Image Super-Resolution`
@@ -185,7 +185,7 @@ class MESA(nn.Module):
     """
 
     def __init__(self, esa_channels, n_feats, conv):
-        super(MESA, self).__init__()
+        super(ESA, self).__init__()
         f = esa_channels
         self.conv1 = conv(n_feats, f, kernel_size=1)
         self.conv_f = conv(f, f, kernel_size=1)
@@ -246,19 +246,21 @@ class BFFB(nn.Module):
             out_channels = in_channels
 
         # 前两层使用BSConv（先1x1再DWConv，保持与BSConvU一致）
-        self.c1_r = BSConv(in_channels, in_channels, kernel_size=3)
-        self.c2_r = BSConv(in_channels, in_channels, kernel_size=3)
+        #self.c1_r = BSConv(in_channels, in_channels, kernel_size=3)
+        #self.c2_r = BSConv(in_channels, in_channels, kernel_size=3)
 
+        self.c1_r = GhostConv(in_channels, in_channels, kernel_size=3, ratio=0.5, stride=1, bias=True)
+        self.c2_r = GhostConv(in_channels, in_channels, kernel_size=3, ratio=0.5, stride=1, bias=True)
         # 第三层GhostConv
-        self.c3_r = GhostConv(in_channels, in_channels, kernel_size=3, ratio=0.5, stride=1, bias=True)
+        #self.c3_r = GhostConv(in_channels, in_channels, kernel_size=3, ratio=0.5, stride=1, bias=True)
 
         
 
         # Conv1
         self.c4 = conv_layer(in_channels, out_channels, 1)
         
+        self.esa = ESA(esa_channels, out_channels, nn.Conv2d)
         self.cca = CCA(out_channels, reduction=4)
-        self.esa = MESA(esa_channels, out_channels, nn.Conv2d)
         self.act = activation('gelu')
 
     def forward(self, x):
@@ -268,14 +270,13 @@ class BFFB(nn.Module):
         out = (self.c2_r(out))
         out = self.act(out)
 
-        out = (self.c3_r(out))
-        out = self.act(out)
+        #out = (self.c3_r(out))
+        #out = self.act(out)
 
         out = out + x
         out = self.c4(out)
-        # 先经过CCA通道注意力，再送入MESA
-        out = self.cca(out)
-        out = self.esa(out)
+        
+        out = self.cca(self.esa(out))
 
         return out
 

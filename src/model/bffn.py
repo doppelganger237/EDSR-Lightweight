@@ -25,6 +25,8 @@ class BFFN(nn.Module):
         # 多个轻量特征块（RLFB变体）
         self.blocks = nn.ModuleList([B.BFFB(in_channels=num_features) for _ in range(num_resblocks)])
 
+        self.post_blocks_conv1 = nn.Conv2d(num_features, num_features, kernel_size=1, bias=True)
+
         # 特征细化模块：对融合后的特征进行卷积增强，并与浅层特征做残差连接
         self.refine_conv = B.conv_layer(num_features, num_features, kernel_size=3)
 
@@ -40,6 +42,8 @@ class BFFN(nn.Module):
         features = shallow_features
         for blk in self.blocks:
             features = blk(features)  # 串联，每块输入是上一块输出
+
+        features = self.post_blocks_conv1(features)
 
         # 特征细化 + 残差
         refined_features = self.refine_conv(features) + shallow_features
