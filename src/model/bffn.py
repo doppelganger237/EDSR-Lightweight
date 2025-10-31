@@ -354,7 +354,7 @@ class BFFN(nn.Module):
 
         # 多个轻量特征块（RLFB变体）
         self.blocks = nn.ModuleList([
-            BFFB(in_channels=num_features, use_esa=(i % 2 == 0))  # 偶数块使用 ESA
+            BFFB(in_channels=num_features, use_esa=(i % 2 == 1))  # 偶数块和最后一个块使用 ESA
             for i in range(num_resblocks)
         ])
 
