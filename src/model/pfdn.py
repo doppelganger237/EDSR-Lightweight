@@ -1,40 +1,15 @@
 # -*- coding: utf-8 -*-
 # Copyright 2022 ByteDance
 import torch.nn as nn
+# -*- coding: utf-8 -*-
+# Copyright 2022 ByteDance
 from collections import OrderedDict
+import torch.nn as nn
 import torch.nn.functional as F
-import torch
-
-class BSConvU(nn.Module):
-    """Blueprint Separable Convolution (Unshared)
-       按照原论文定义：先 1×1 Conv，再 Depthwise Conv
-    """
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=None, bias=True):
-        super().__init__()
-        if padding is None:
-            padding = (kernel_size - 1) // 2
-
-        # 先 Pointwise 生成通道蓝图
-        self.pw = nn.Conv2d(in_channels, out_channels, 1, bias=bias)
-        # 再 Depthwise 应用空间模板
-        self.dw = nn.Conv2d(out_channels, out_channels, kernel_size,
-                            stride=stride, padding=padding,
-                            groups=out_channels, bias=bias)
-
-    def forward(self, x):
-        return self.dw(self.pw(x))
+import torch    
+from model.lib import BSConvU, simam_module
 
 
-
-# Alias: BSConv = BSConvU
-class BSConv(BSConvU):
-    """
-    BSConv: Alias of BSConvU for convenience.
-    默认使用Unshared Blueprint版本。
-    """
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=None, bias=True):
-        super(BSConv, self).__init__(in_channels, out_channels, kernel_size, stride, padding, bias)
-    
 def _make_pair(value):
     if isinstance(value, int):
         value = (value,) * 2
@@ -128,36 +103,23 @@ def pixelshuffle_block(in_channels,
     pixel_shuffle = nn.PixelShuffle(upscale_factor)
     return sequential(conv, pixel_shuffle)
 
-
-def mean_channels(F):
-    assert(F.dim() == 4)
-    spatial_sum = F.sum(3, keepdim=True).sum(2, keepdim=True)
-    return spatial_sum / (F.size(2) * F.size(3))
-
-def stdv_channels(F):
-    assert (F.dim() == 4)
-    F_mean = mean_channels(F)
-    F_variance = (F - F_mean).pow(2).sum(3, keepdim=True).sum(2, keepdim=True) / (F.size(2) * F.size(3))
-    return F_variance.pow(0.5)
-
-class CCA(nn.Module):
-    def __init__(self, channel, reduction=16):
-        super(CCA, self).__init__()
-
-        self.contrast = stdv_channels
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv_du = nn.Sequential(
-            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=True),
+class LCA(nn.Module):
+    """Lightweight Channel Attention: GAP + 1x1 Conv + Sigmoid"""
+    def __init__(self, channels, reduction=32):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)  # GAP
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=True),
+            nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=True),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        y = self.contrast(x) + self.avg_pool(x)
-        y = self.conv_du(y)
-        return x * y
-
+        y = self.pool(x)
+        y = self.conv(y)
+        return x * y  # channel-wise scaling
+    
 class ESA(nn.Module):
     """
     Modification of Enhanced Spatial Attention (ESA), which is proposed by 
@@ -190,48 +152,65 @@ class ESA(nn.Module):
         return x * m
 
 
-class RLFB(nn.Module):
-    """
-    Residual Local Feature Block (RLFB).
-    """
+class PFDB(nn.Module):
 
     def __init__(self,
                  in_channels,
                  mid_channels=None,
                  out_channels=None,
-                 esa_channels=16):
-        super(RLFB, self).__init__()
+                 esa_channels=16,
+                 lca_reduction=32):
+        super(PFDB, self).__init__()
 
         if mid_channels is None:
             mid_channels = in_channels
         if out_channels is None:
             out_channels = in_channels
 
-        self.c1_r = BSConv(in_channels, mid_channels, 3)
-        self.c2_r = BSConv(mid_channels, mid_channels, 3)
-        self.c3_r = BSConv(mid_channels, in_channels, 3)
+        self.c1_r = conv_layer(in_channels, mid_channels, 3)
+
+        half_channels = mid_channels // 2
+        self.c2_r_front = conv_layer(half_channels, half_channels, 3)
+        self.c2_r_back = BSConvU(mid_channels - half_channels, mid_channels - half_channels, kernel_size=3)
+        self.mix_conv = nn.Conv2d(mid_channels, mid_channels, kernel_size=1)
+        
+        self.c3_r = conv_layer(mid_channels, in_channels, 3)
 
         self.c5 = conv_layer(in_channels, out_channels, 1)
+        self.lca = LCA(mid_channels, reduction=lca_reduction)
         self.esa = ESA(esa_channels, out_channels, nn.Conv2d)
-        self.cca= CCA(out_channels)
         self.act = activation('gelu', neg_slope=0.05)
 
+
     def forward(self, x):
-        out = (self.c1_r(x))
+        out = self.c1_r(x)
         out = self.act(out)
+        out = self.lca(out)
 
-        out = (self.c2_r(out))
-        out = self.act(out)
+        half = out.shape[1] // 2
+        front = out[:, :half]
+        back = out[:, half:]
 
-        out = (self.c3_r(out))
+        front = self.c2_r_front(front)
+        back = self.c2_r_back(back)
+        out = torch.cat([front, back], dim=1)
+
+        out = self.mix_conv(out)   # 通道交互融合
         out = self.act(out)
+        out = self.lca(out)
+
+        out = self.c3_r(out)
+        out = self.act(out)
+        out = self.lca(out)
 
         out = out + x
-        out = self.cca(self.esa(self.c5(out)))
+        out = self.esa(self.c5(out))
 
         return out
 
-class RLFN(nn.Module):
+
+
+class PFDN(nn.Module):
     """
     Residual Local Feature Network (RLFN)
     Model definition of RLFN in `Residual Local Feature Network for 
@@ -239,47 +218,54 @@ class RLFN(nn.Module):
     """
 
     def __init__(self,
+                 args,
                  in_channels=3,
                  out_channels=3,
-                 feature_channels=64,
+                 feature_channels=52,
                  upscale=2,
-                 num_blocks=12):
-        super(RLFN, self).__init__()
+                 num_blocks=6):
+        super(PFDN, self).__init__()
 
-        # self.conv_1 = conv_layer(in_channels,
-        #                                feature_channels,
-        #                                kernel_size=3)
+        num_blocks = args.n_resblocks 
+        feature_channels = args.n_feats
+        upscale = args.scale[0]
+        
+        self.conv_1 = conv_layer(in_channels,
+                                       feature_channels,
+                                       kernel_size=3)
 
+        self.blocks = nn.ModuleList([PFDB(feature_channels) for _ in range(num_blocks)])
 
-        self.fea_conv = BSConv(in_channels * 4, feature_channels, kernel_size=3)
+        self.conv_2 = conv_layer(feature_channels,
+                                       feature_channels,
+                                       kernel_size=3)
 
-        # Use nn.Sequential to create multiple RLFB blocks dynamically
-        self.blocks = nn.Sequential(*[RLFB(feature_channels) for _ in range(num_blocks)])
-
-        # self.conv_2 = conv_layer(feature_channels,
-        #                                feature_channels,
-        #                                kernel_size=3)
-        self.conv_2 = BSConv(feature_channels, feature_channels, kernel_size=3)
+        self.fusion_conv = nn.Conv2d(feature_channels * 2, feature_channels, kernel_size=1)
 
         self.upsampler = pixelshuffle_block(feature_channels,
                                                   out_channels,
                                                   upscale_factor=upscale)
 
     def forward(self, x):
+        out_feature = self.conv_1(x)
 
+        block_outputs = []
+        out = out_feature
+        for block in self.blocks:
+            out = block(out)
+            block_outputs.append(out)
 
+        fused = self.fusion_conv(torch.cat([block_outputs[0], block_outputs[-1]], dim=1))
 
-        x = torch.cat([x, x, x, x], dim=1)
-        out_feature = self.fea_conv(x)
-
-        out_b = self.blocks(out_feature)
-        out_low_resolution = self.conv_2(out_b) + out_feature
+        out_low_resolution = self.conv_2(fused) + out_feature
         output = self.upsampler(out_low_resolution)
 
         return output
     
 def make_model(args, parent=False):
-    model = RLFN()
+    model =  PFDN(args)
+    
     params = sum(p.numel() for p in model.parameters())
     print(f"Params: {params/1e3:.1f}K")
+
     return model

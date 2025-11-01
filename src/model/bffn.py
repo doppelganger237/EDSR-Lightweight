@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import OrderedDict
-from model.OREPA import OREPA
+#from model.OREPA import OREPA
+from model.ecb import ECB
 
 def conv_layer(in_channels, out_channels, kernel_size, stride=1, dilation=1, groups=1):
     padding = int((kernel_size - 1) / 2) * dilation
@@ -277,30 +278,48 @@ class BFFB(nn.Module):
 
         self.use_esa = use_esa
 
-        self.c1_r = OREPA(
-            in_channels=in_channels,
-            out_channels=mid_channels,
-            kernel_size=3,
-            padding=1,   # ✅ 一定要加
-            deploy=deploy,
-            nonlinear=None,
-            weight_only=False
-        )
-        self.c2_r = OREPA(
-            in_channels=mid_channels,
-            out_channels=mid_channels,
-            kernel_size=3,
-            padding=1,   # ✅ 一定要加
-            deploy=deploy,
-        )
+        self.c1_r = ECB(
+            inp_planes=in_channels,
+            out_planes=mid_channels,
+            depth_multiplier= 2,
+            act_type="linear",with_idt=False)
+        
+        self.c2_r = ECB(
+            inp_planes=mid_channels,
+            out_planes=mid_channels,
+            depth_multiplier= 2,
+            act_type="linear",with_idt=False)
+        
+        self.c3_r = ECB(
+            inp_planes=mid_channels,
+            out_planes=out_channels,
+            depth_multiplier= 2,
+            act_type="linear",with_idt=False)
+        
+        # self.c1_r = OREPA(
+        #     in_channels=in_channels,
+        #     out_channels=mid_channels,
+        #     kernel_size=3,
+        #     padding=1,   # ✅ 一定要加
+        #     deploy=deploy,
+        #     nonlinear=None,
+        #     weight_only=False
+        # )
+        # self.c2_r = OREPA(
+        #     in_channels=mid_channels,
+        #     out_channels=mid_channels,
+        #     kernel_size=3,
+        #     padding=1,   # ✅ 一定要加
+        #     deploy=deploy,
+        # )
 
-        self.c3_r = OREPA(
-            in_channels=mid_channels,
-            out_channels=out_channels,
-            kernel_size=3,
-            padding=1,   # ✅ 一定要加
-            deploy=deploy,
-        )
+        # self.c3_r = OREPA(
+        #     in_channels=mid_channels,
+        #     out_channels=out_channels,
+        #     kernel_size=3,
+        #     padding=1,   # ✅ 一定要加
+        #     deploy=deploy,
+        # )
 
         self.fuse = conv_layer(in_channels, out_channels, 1)
 
@@ -342,15 +361,12 @@ class BFFN(nn.Module):
         # 特征提取模块：初步提取浅层特征，使用Conv3
         #self.feature_extraction = conv_layer(in_channels, num_features, kernel_size=3)
 
-        self.feature_extraction = OREPA(
-            in_channels=in_channels,
-            out_channels=num_features,
-            kernel_size=3,
-            padding=1,   # ✅ 一定要加
-            deploy=deploy,
-            nonlinear=None,
-            weight_only=False
-        )
+        self.feature_extraction =  ECB(
+            inp_planes=in_channels,
+            out_planes=num_features,
+            depth_multiplier= 2,
+            act_type="linear")
+        
 
         # 多个轻量特征块（RLFB变体）
         self.blocks = nn.ModuleList([
@@ -362,15 +378,11 @@ class BFFN(nn.Module):
         # 特征细化模块：对融合后的特征进行卷积增强，并与浅层特征做残差连接
         #self.refine_conv = conv_layer(num_features, num_features, kernel_size=3)
 
-        self.refine_conv = OREPA(
-            in_channels=num_features,
-            out_channels=num_features,
-            kernel_size=3,
-            padding=1,   # ✅ 一定要加
-            deploy=deploy,
-            nonlinear=None,
-            weight_only=False
-        )
+        self.refine_conv =  ECB(
+            inp_planes=num_features,
+            out_planes=num_features,
+            depth_multiplier= 2,
+            act_type="linear",with_idt=False)
 
         
         # 上采样模块：使用 PixelShuffle 实现分辨率提升
