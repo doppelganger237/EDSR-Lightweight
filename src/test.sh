@@ -24,7 +24,7 @@ python main.py --model PFDN --scale 2 --patch_size 96 --save test --n_threads 0 
 #python main.py --model SPAN --scale 2 --patch_size 96 --save span --n_threads 0 --lr 1e-4 --batch_size 16
 
 
-#python main.py --model RepRLFN --data_test Set5+Set14+B100+Urban100 --scale 4 --pre_train ../models/team25_RepRLFN.pth --test_only --n_threads 0
+#python main.py --model PFDN --data_test Set5+Set14+B100+Urban100 --scale 2 --pre_train ../experiment/pfdn/model/model_best.pt --test_only --n_threads 0 --n_resblocks 6 --n_feats 52
 
 
 

@@ -7,7 +7,7 @@ from collections import OrderedDict
 import torch.nn as nn
 import torch.nn.functional as F
 import torch    
-from model.lib import BSConvU, simam_module
+from model.lib import BSConvU
 
 
 def _make_pair(value):
@@ -58,6 +58,8 @@ def activation(act_type, inplace=True, neg_slope=0.05, n_prelu=1):
         layer = nn.PReLU(num_parameters=n_prelu, init=neg_slope)
     elif act_type == 'gelu':
         layer = nn.GELU()
+    elif act_type == 'silu':
+        layer = nn.SiLU(inplace=inplace)
     else:
         raise NotImplementedError(
             'activation layer [{:s}] is not found'.format(act_type))
@@ -179,8 +181,8 @@ class PFDB(nn.Module):
         self.c5 = conv_layer(in_channels, out_channels, 1)
         self.lca = LCA(mid_channels, reduction=lca_reduction)
         self.esa = ESA(esa_channels, out_channels, nn.Conv2d)
-        self.act = activation('gelu', neg_slope=0.05)
-
+       #self.act = activation('gelu', neg_slope=0.05)
+        self.act = activation('silu')
 
     def forward(self, x):
         out = self.c1_r(x)
@@ -240,7 +242,7 @@ class PFDN(nn.Module):
                                        feature_channels,
                                        kernel_size=3)
 
-        self.fusion_conv = nn.Conv2d(feature_channels * 2, feature_channels, kernel_size=1)
+        self.fusion_conv = nn.Conv2d(feature_channels * 3, feature_channels, kernel_size=1)
 
         self.upsampler = pixelshuffle_block(feature_channels,
                                                   out_channels,
@@ -255,7 +257,13 @@ class PFDN(nn.Module):
             out = block(out)
             block_outputs.append(out)
 
-        fused = self.fusion_conv(torch.cat([block_outputs[0], block_outputs[-1]], dim=1))
+        #fused = self.fusion_conv(torch.cat([block_outputs[0], block_outputs[-1]], dim=1))
+        
+        fused = self.fusion_conv(torch.cat([
+            out_feature,          # 浅层特征
+            block_outputs[0],     # 第一块的输出（低层局部特征）
+            block_outputs[-1]     # 最后一块的输出（深层特征）
+        ], dim=1))
 
         out_low_resolution = self.conv_2(fused) + out_feature
         output = self.upsampler(out_low_resolution)
