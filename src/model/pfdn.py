@@ -1,8 +1,3 @@
-# -*- coding: utf-8 -*-
-# Copyright 2022 ByteDance
-import torch.nn as nn
-# -*- coding: utf-8 -*-
-# Copyright 2022 ByteDance
 from collections import OrderedDict
 import torch.nn as nn
 import torch.nn.functional as F
@@ -112,7 +107,6 @@ class LCA(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)  # GAP
         self.conv = nn.Sequential(
             nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=True),
-            nn.ReLU(inplace=True),
             nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=True),
             nn.Sigmoid()
         )
@@ -120,7 +114,7 @@ class LCA(nn.Module):
     def forward(self, x):
         y = self.pool(x)
         y = self.conv(y)
-        return x * y  # channel-wise scaling
+        return x + x * y
     
 class ESA(nn.Module):
     """
@@ -160,6 +154,7 @@ class PFDB(nn.Module):
                  in_channels,
                  mid_channels=None,
                  out_channels=None,
+                 act = 'silu',
                  esa_channels=16,
                  lca_reduction=32):
         super(PFDB, self).__init__()
@@ -181,13 +176,11 @@ class PFDB(nn.Module):
         self.c5 = conv_layer(in_channels, out_channels, 1)
         self.lca = LCA(mid_channels, reduction=lca_reduction)
         self.esa = ESA(esa_channels, out_channels, nn.Conv2d)
-       #self.act = activation('gelu', neg_slope=0.05)
-        self.act = activation('silu')
+        self.act = activation(act)
 
     def forward(self, x):
         out = self.c1_r(x)
         out = self.act(out)
-        out = self.lca(out)
 
         half = out.shape[1] // 2
         front = out[:, :half]
@@ -195,15 +188,13 @@ class PFDB(nn.Module):
 
         front = self.c2_r_front(front)
         back = self.c2_r_back(back)
-        out = torch.cat([front, back], dim=1)
+        out_before_mix = torch.cat([front, back], dim=1)
 
-        out = self.mix_conv(out)   # 通道交互融合
+        out = self.mix_conv(out_before_mix) + out_before_mix   # 通道交互融合，加入局部短残差
         out = self.act(out)
-        out = self.lca(out)
 
         out = self.c3_r(out)
         out = self.act(out)
-        out = self.lca(out)
 
         out = out + x
         out = self.esa(self.c5(out))
@@ -213,11 +204,6 @@ class PFDB(nn.Module):
 
 
 class PFDN(nn.Module):
-    """
-    Residual Local Feature Network (RLFN)
-    Model definition of RLFN in `Residual Local Feature Network for 
-    Efficient Super-Resolution`
-    """
 
     def __init__(self,
                  args,
@@ -231,12 +217,16 @@ class PFDN(nn.Module):
         num_blocks = args.n_resblocks 
         feature_channels = args.n_feats
         upscale = args.scale[0]
+        in_channels = args.n_colors
+        out_channels = args.n_colors
+        kernel_size = 3
+        act = args.act
         
         self.conv_1 = conv_layer(in_channels,
                                        feature_channels,
-                                       kernel_size=3)
+                                       kernel_size=kernel_size)
 
-        self.blocks = nn.ModuleList([PFDB(feature_channels) for _ in range(num_blocks)])
+        self.blocks = nn.ModuleList([PFDB(feature_channels, act=act) for _ in range(num_blocks)])
 
         self.conv_2 = conv_layer(feature_channels,
                                        feature_channels,
@@ -244,29 +234,36 @@ class PFDN(nn.Module):
 
         self.fusion_conv = nn.Conv2d(feature_channels * 3, feature_channels, kernel_size=1)
 
+        self.reweight = nn.Conv2d(feature_channels, feature_channels, kernel_size=1, bias=True)
+        
+
         self.upsampler = pixelshuffle_block(feature_channels,
                                                   out_channels,
                                                   upscale_factor=upscale)
 
     def forward(self, x):
-        out_feature = self.conv_1(x)
+        # Step 1. Shallow feature extraction
+        shallow = self.conv_1(x)
 
-        block_outputs = []
-        out = out_feature
-        for block in self.blocks:
+        # Step 2. Deep feature extraction
+        first_block_out = None
+        out = shallow
+        for i, block in enumerate(self.blocks):
             out = block(out)
-            block_outputs.append(out)
+            if i == 0:
+                first_block_out = out
+        last_block_out = out  # final deep feature
 
-        #fused = self.fusion_conv(torch.cat([block_outputs[0], block_outputs[-1]], dim=1))
-        
-        fused = self.fusion_conv(torch.cat([
-            out_feature,          # 浅层特征
-            block_outputs[0],     # 第一块的输出（低层局部特征）
-            block_outputs[-1]     # 最后一块的输出（深层特征）
-        ], dim=1))
+        # Step 3. Feature fusion
+        fused_input = torch.cat([shallow, first_block_out, last_block_out], dim=1)
+        fused = self.fusion_conv(fused_input)
 
-        out_low_resolution = self.conv_2(fused) + out_feature
-        output = self.upsampler(out_low_resolution)
+        # Step 4. Residual reweighting
+        fused = fused + fused * torch.sigmoid(self.reweight(fused))
+
+        # Step 5. Reconstruction and Upsampling
+        fused = self.conv_2(fused) + shallow
+        output = self.upsampler(fused)
 
         return output
     

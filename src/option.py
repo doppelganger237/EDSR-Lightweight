@@ -48,7 +48,7 @@ parser.add_argument('--no_augment', action='store_true',
 parser.add_argument('--model', default='EDSR',
                     help='model name')
 
-parser.add_argument('--act', type=str, default='relu',
+parser.add_argument('--act', type=str, default='silu',
                     help='activation function')
 parser.add_argument('--pre_train', type=str, default='',
                     help='pre-trained model directory')

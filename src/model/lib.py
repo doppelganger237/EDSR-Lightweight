@@ -104,29 +104,16 @@ class BSConvS(torch.nn.Module):
 
 
 
-class simam_module(torch.nn.Module):
-    def __init__(self, channels = None, e_lambda = 1e-4):
-        super(simam_module, self).__init__()
-
-        self.activaton = nn.Sigmoid()
-        self.e_lambda = e_lambda
-
-    def __repr__(self):
-        s = self.__class__.__name__ + '('
-        s += ('lambda=%f)' % self.e_lambda)
-        return s
-
-    @staticmethod
-    def get_module_name():
-        return "simam"
+class eca_layer(nn.Module):
+    def __init__(self, channel, k_size=3):
+        super(eca_layer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)               # pool
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, 
+                              padding=(k_size - 1) // 2, bias=False)  # conv1
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-
-        b, c, h, w = x.size()
-        
-        n = w * h - 1
-
-        x_minus_mu_square = (x - x.mean(dim=[2,3], keepdim=True)).pow(2)
-        y = x_minus_mu_square / (4 * (x_minus_mu_square.sum(dim=[2,3], keepdim=True) / n + self.e_lambda)) + 0.5
-
-        return x * self.activaton(y)
+        y = self.avg_pool(x)                                  # [B, C, 1, 1]
+        y = self.conv(y.squeeze(-1).transpose(-1, -2))        # [B, 1, C]
+        y = self.sigmoid(y).transpose(-1, -2).unsqueeze(-1)   # [B, C, 1, 1]
+        return x * y
