@@ -51,6 +51,7 @@ class Trainer():
         self.model.train()
 
         timer_data, timer_model = utility.timer(), utility.timer()
+        timer_data.tic()  # Start timing data loading BEFORE entering the loop
         # TEMP
         self.loader_train.dataset.set_scale(0)
         for batch, (lr, hr, _,) in enumerate(self.loader_train):
