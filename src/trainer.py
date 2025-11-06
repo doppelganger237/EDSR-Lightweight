@@ -51,14 +51,11 @@ class Trainer():
         self.model.train()
 
         timer_data, timer_model = utility.timer(), utility.timer()
-        timer_data.tic()  # Start timing data loading BEFORE entering the loop
         # TEMP
         self.loader_train.dataset.set_scale(0)
         for batch, (lr, hr, _,) in enumerate(self.loader_train):
             lr, hr = self.prepare(lr, hr)
             timer_data.hold()
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
             timer_model.tic()
             self.optimizer.zero_grad()
             
@@ -82,14 +79,15 @@ class Trainer():
                     utils.clip_grad_value_(self.model.parameters(), self.args.gclip)
                 self.optimizer.step()
 
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            timer_model.hold()
+            # self.optimizer.zero_grad()
+            # sr = self.model(lr, 0)
+            # loss = self.loss(sr, hr)
+            # loss.backward()
+            # if self.args.gclip > 0:
+            #     utils.clip_grad_value_(self.model.parameters(), self.args.gclip)
+            # self.optimizer.step()
 
-            # Ensure GPU has fully completed operations before starting data load timing
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            timer_data.tic()
+            timer_model.hold()
 
             if (batch + 1) % self.args.print_every == 0:
                 self.ckp.write_log('[{}/{}]\t{}\t{:.1f}+{:.1f}s'.format(
@@ -98,6 +96,8 @@ class Trainer():
                     self.loss.display_loss(batch),
                     timer_model.release(),
                     timer_data.release()))
+
+            timer_data.tic()
 
         self.loss.end_log(len(self.loader_train))
         self.error_last = self.loss.log[-1, -1]
