@@ -148,6 +148,8 @@ parser.add_argument('--save_gt', action='store_true',
 
 parser.add_argument('--use_amp', action='store_true',
                     help='use automatic mixed precision')
+parser.add_argument('--cache_dir', type=str, default='',
+                    help='path to cache directory for datasets')
 
 args = parser.parse_args()
 template.set_template(args)

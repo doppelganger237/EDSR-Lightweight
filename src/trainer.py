@@ -57,7 +57,8 @@ class Trainer():
             lr, hr = self.prepare(lr, hr)
             timer_data.hold()
             timer_model.tic()
-
+            self.optimizer.zero_grad()
+            
             if self.use_amp:
                 # 使用自动混合精度
                 with autocast(device_type=self.model.device.type):

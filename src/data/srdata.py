@@ -24,7 +24,13 @@ class SRData(data.Dataset):
         
         self._set_filesystem(args.dir_data)
         if args.ext.find('img') < 0:
-            path_bin = os.path.join(self.apath, 'bin')
+            # 支持自定义缓存路径
+            cache_root = getattr(args, 'cache_dir', None)
+            if cache_root is None or cache_root == '':
+                path_bin = os.path.join(self.apath, 'bin')
+            else:
+                path_bin = os.path.join(cache_root, self.name, 'bin')
+
             os.makedirs(path_bin, exist_ok=True)
 
         list_hr, list_lr = self._scan()
@@ -154,4 +160,3 @@ class SRData(data.Dataset):
             self.idx_scale = idx_scale
         else:
             self.idx_scale = random.randint(0, len(self.scale) - 1)
-
