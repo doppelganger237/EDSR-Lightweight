@@ -12,7 +12,7 @@
 
 
 
-python main.py --model PFDN --scale 2 --patch_size 64 --save test --n_threads 0 --lr 5e-4 --n_resblocks 6 --n_feats 52 --batch_size 16
+python main.py --model PFDN --scale 2 --patch_size 64 --save test --n_threads 10 --lr 5e-4 --n_resblocks 6 --n_feats 52 --batch_size 16 --use_amp
 
 #python main.py --model bsrn --scale 2 --patch_size 96 --save rlfn_bsconv --n_threads 0 --batch_size 64 --lr 5e-4
 

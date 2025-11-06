@@ -56,6 +56,8 @@ class Trainer():
         for batch, (lr, hr, _,) in enumerate(self.loader_train):
             lr, hr = self.prepare(lr, hr)
             timer_data.hold()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             timer_model.tic()
             self.optimizer.zero_grad()
             
@@ -79,14 +81,8 @@ class Trainer():
                     utils.clip_grad_value_(self.model.parameters(), self.args.gclip)
                 self.optimizer.step()
 
-            # self.optimizer.zero_grad()
-            # sr = self.model(lr, 0)
-            # loss = self.loss(sr, hr)
-            # loss.backward()
-            # if self.args.gclip > 0:
-            #     utils.clip_grad_value_(self.model.parameters(), self.args.gclip)
-            # self.optimizer.step()
-
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             timer_model.hold()
 
             if (batch + 1) % self.args.print_every == 0:
