@@ -86,6 +86,11 @@ class Trainer():
                 torch.cuda.synchronize()
             timer_model.hold()
 
+            # Ensure GPU has fully completed operations before starting data load timing
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            timer_data.tic()
+
             if (batch + 1) % self.args.print_every == 0:
                 self.ckp.write_log('[{}/{}]\t{}\t{:.1f}+{:.1f}s'.format(
                     (batch + 1) * self.args.batch_size,
@@ -93,8 +98,6 @@ class Trainer():
                     self.loss.display_loss(batch),
                     timer_model.release(),
                     timer_data.release()))
-
-            timer_data.tic()
 
         self.loss.end_log(len(self.loader_train))
         self.error_last = self.loss.log[-1, -1]
