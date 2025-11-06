@@ -285,10 +285,12 @@ def make_optimizer(args, target):
     optimizer._register_scheduler(scheduler_class, **kwargs_scheduler)
     return optimizer
 
-def calc_ssim(sr, hr, scale, rgb_range=255):
+def calc_ssim(sr, hr, scale, rgb_range, dataset=None):
     """
-    Calculate Structural Similarity Index (SSIM).
+    Calculate SSIM (Structural Similarity Index).
+    Follows same logic as calc_psnr: crop borders & convert to Y channel if benchmark.
     """
+
     if hr.nelement() == 1:
         return 0
 
@@ -296,45 +298,59 @@ def calc_ssim(sr, hr, scale, rgb_range=255):
     sr = sr / rgb_range
     hr = hr / rgb_range
 
-    # Convert to grayscale if 3 channels, else keep first channel
-    if sr.size(1) == 3:
-        sr_gray = 0.2989 * sr[:, 0, :, :] + 0.5870 * sr[:, 1, :, :] + 0.1140 * sr[:, 2, :, :]
-        hr_gray = 0.2989 * hr[:, 0, :, :] + 0.5870 * hr[:, 1, :, :] + 0.1140 * hr[:, 2, :, :]
+    shave = scale
+
+    # ---- match calc_psnr logic ----
+    if dataset and dataset.dataset.benchmark:
+        # Convert RGB to Y (luminance)
+        if sr.size(1) == 3:
+            gray_coeffs = [65.738, 129.057, 25.064]
+            convert = sr.new_tensor(gray_coeffs).view(1, 3, 1, 1) / 256
+            sr_gray = sr.mul(convert).sum(dim=1, keepdim=True)
+            hr_gray = hr.mul(convert).sum(dim=1, keepdim=True)
+        else:
+            sr_gray = sr
+            hr_gray = hr
+        shave = scale
     else:
-        sr_gray = sr[:, 0, :, :]
-        hr_gray = hr[:, 0, :, :]
+        # for non-benchmark datasets (DIV2K etc.)
+        if sr.size(1) == 3:
+            sr_gray = 0.2989 * sr[:, 0:1, :, :] + 0.5870 * sr[:, 1:2, :, :] + 0.1140 * sr[:, 2:3, :, :]
+            hr_gray = 0.2989 * hr[:, 0:1, :, :] + 0.5870 * hr[:, 1:2, :, :] + 0.1140 * hr[:, 2:3, :, :]
+        else:
+            sr_gray = sr
+            hr_gray = hr
+        shave = scale + 6
 
-    # Crop edges consistent with calc_psnr strategy
-    if scale > 0:
-        sr_gray = sr_gray[..., scale:-scale, scale:-scale]
-        hr_gray = hr_gray[..., scale:-scale, scale:-scale]
+    # ---- crop like calc_psnr ----
+    sr_gray = sr_gray[..., shave:-shave, shave:-shave]
+    hr_gray = hr_gray[..., shave:-shave, shave:-shave]
 
-    # Define 11x11 Gaussian kernel
+    # ---- SSIM kernel ----
     def gaussian(window_size=11, sigma=1.5):
         coords = torch.arange(window_size).float() - (window_size - 1) / 2
-        g = torch.exp(-(coords**2) / (2 * sigma**2))
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
         g /= g.sum()
-        return g.unsqueeze(1) @ g.unsqueeze(0)  # 2D gaussian kernel
+        return g.unsqueeze(1) @ g.unsqueeze(0)
 
-    kernel = gaussian().to(sr.device)
-    kernel = kernel.unsqueeze(0).unsqueeze(0)  # shape (1,1,11,11)
+    kernel = gaussian().to(sr.device).unsqueeze(0).unsqueeze(0)
 
-    mu1 = F.conv2d(sr_gray.unsqueeze(1), kernel, padding=5)
-    mu2 = F.conv2d(hr_gray.unsqueeze(1), kernel, padding=5)
+    mu1 = F.conv2d(sr_gray, kernel, padding=5)
+    mu2 = F.conv2d(hr_gray, kernel, padding=5)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1**2, mu2**2, mu1 * mu2
 
-    mu1_sq = mu1 ** 2
-    mu2_sq = mu2 ** 2
-    mu1_mu2 = mu1 * mu2
+    sigma1_sq = F.conv2d(sr_gray**2, kernel, padding=5) - mu1_sq
+    sigma2_sq = F.conv2d(hr_gray**2, kernel, padding=5) - mu2_sq
+    sigma12 = F.conv2d(sr_gray * hr_gray, kernel, padding=5) - mu1_mu2
 
-    sigma1_sq = F.conv2d(sr_gray.unsqueeze(1)**2, kernel, padding=5) - mu1_sq
-    sigma2_sq = F.conv2d(hr_gray.unsqueeze(1)**2, kernel, padding=5) - mu2_sq
-    sigma12 = F.conv2d((sr_gray.unsqueeze(1) * hr_gray.unsqueeze(1)), kernel, padding=5) - mu1_mu2
-
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
+    # ---- constants (for normalized [0,1]) ----
+    L = 1.0
+    C1 = (0.01 * L) ** 2
+    C2 = (0.03 * L) ** 2
 
     ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
                ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
     return ssim_map.mean().item()
 
 if __name__ == '__main__':

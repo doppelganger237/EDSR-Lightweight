@@ -146,6 +146,9 @@ parser.add_argument('--save_gt', action='store_true',
 
 
 
+parser.add_argument('--use_amp', action='store_true',
+                    help='use automatic mixed precision')
+
 args = parser.parse_args()
 template.set_template(args)
 

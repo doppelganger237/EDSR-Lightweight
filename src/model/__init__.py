@@ -9,7 +9,7 @@ import torch.utils.model_zoo
 class Model(nn.Module):
     def __init__(self, args, ckp):
         super(Model, self).__init__()
-        print(f'Making model: {args.model} ...')
+        print(f'Making model: {args.model}x{args.scale[0]} ...')
 
         self.scale = args.scale
         self.idx_scale = 0

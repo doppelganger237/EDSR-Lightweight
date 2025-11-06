@@ -8,6 +8,9 @@ import torch
 import torch.nn.utils as utils
 from tqdm import tqdm
 
+#from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
+
 
 class Trainer():
     def __init__(self, args, loader, my_model, my_loss, ckp):
@@ -20,6 +23,16 @@ class Trainer():
         self.model = my_model
         self.loss = my_loss
         self.optimizer = utility.make_optimizer(args, self.model)
+
+        # AMP 设置（可选）
+        self.use_amp = args.use_amp
+        if self.use_amp:
+            self.scaler = GradScaler(self.model.device.type)
+        else:
+            self.scaler = None
+
+        # 打印 AMP 状态（只执行一次）
+        self.ckp.write_log(f"AMP enabled: {self.use_amp}")
 
         if self.args.load != '':
             self.optimizer.load(ckp.dir, epoch=len(ckp.log))
@@ -45,13 +58,33 @@ class Trainer():
             timer_data.hold()
             timer_model.tic()
 
-            self.optimizer.zero_grad()
-            sr = self.model(lr, 0)
-            loss = self.loss(sr, hr)
-            loss.backward()
-            if self.args.gclip > 0:
-                utils.clip_grad_value_(self.model.parameters(), self.args.gclip)
-            self.optimizer.step()
+            if self.use_amp:
+                # 使用自动混合精度
+                with autocast(device_type=self.model.device.type):
+                    sr = self.model(lr, 0)
+                    loss = self.loss(sr, hr)
+                self.scaler.scale(loss).backward()
+                if self.args.gclip > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    utils.clip_grad_value_(self.model.parameters(), self.args.gclip)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                # 标准精度训练
+                sr = self.model(lr, 0)
+                loss = self.loss(sr, hr)
+                loss.backward()
+                if self.args.gclip > 0:
+                    utils.clip_grad_value_(self.model.parameters(), self.args.gclip)
+                self.optimizer.step()
+
+            # self.optimizer.zero_grad()
+            # sr = self.model(lr, 0)
+            # loss = self.loss(sr, hr)
+            # loss.backward()
+            # if self.args.gclip > 0:
+            #     utils.clip_grad_value_(self.model.parameters(), self.args.gclip)
+            # self.optimizer.step()
 
             timer_model.hold()
 
@@ -98,7 +131,7 @@ class Trainer():
                     self.ckp.log[-1, idx_data, idx_scale] += utility.calc_psnr(
                         sr, hr, scale, self.args.rgb_range, dataset=d
                     )
-                    ssim_val = utility.calc_ssim(sr, hr, scale)
+                    ssim_val = utility.calc_ssim(sr, hr, scale, self.args.rgb_range, dataset=d)
                     self.ckp.log_ssim[-1, idx_data, idx_scale] += ssim_val
                     if self.args.save_gt:
                         save_list.extend([lr, hr])

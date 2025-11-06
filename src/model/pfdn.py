@@ -228,15 +228,15 @@ class PFDN(nn.Module):
 
         self.blocks = nn.ModuleList([PFDB(feature_channels, act=act) for _ in range(num_blocks)])
 
-        self.conv_2 = conv_layer(feature_channels,
-                                       feature_channels,
-                                       kernel_size=3)
 
         self.fusion_conv = nn.Conv2d(feature_channels * 3, feature_channels, kernel_size=1)
 
         self.reweight = nn.Conv2d(feature_channels, feature_channels, kernel_size=1, bias=True)
         
 
+        self.conv_2 = conv_layer(feature_channels,
+                                       feature_channels,
+                                       kernel_size=3)
         self.upsampler = pixelshuffle_block(feature_channels,
                                                   out_channels,
                                                   upscale_factor=upscale)
