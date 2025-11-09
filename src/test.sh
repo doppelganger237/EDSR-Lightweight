@@ -10,7 +10,7 @@
 
 #python main.py --model BFFN --scale 3 --patch_size 96 --save bffn_x3  --pre_train ../experiment/bffn_ghost/model/model_best.pt --n_threads 0 --lr 5e-4 --reset
 
-python main.py --model PFDN --scale 2 --patch_size 128 --n_resblocks 6 --n_feats 52 --save pfdn --load pfdn --n_threads 0 --lr 5e-4 --batch_size 64 --resume -1 --epochs 1000 --decay 200-400-600-800
+#python main.py --model PFDN --scale 2 --patch_size 128 --n_resblocks 6 --n_feats 52 --save pfdn --load pfdn --n_threads 0 --lr 5e-4 --batch_size 64 --resume -1 --epochs 1000 --decay 200-400-600-800
 
 #python main.py --model PFDN --scale 2 --patch_size 64 --save test --n_threads 10 --lr 5e-4 --n_resblocks 6 --n_feats 52 --batch_size 16 
 
@@ -21,6 +21,8 @@ python main.py --model PFDN --scale 2 --patch_size 128 --n_resblocks 6 --n_feats
 
 #python main.py --model SPAN --scale 2 --patch_size 96 --save span --n_threads 0 --lr 1e-4 --batch_size 16
 
+
+python main.py --model PFDN --scale 4 --patch_size 128 --save test --pre_train ../experiment/pfdn/model/model_best.pt --n_threads 10 --lr 5e-4 --n_resblocks 6 --n_feats 52 --batch_size 16 
 
 #python main.py --model PFDN --data_test Set5+Set14+B100+Urban100 --scale 2 --pre_train ../experiment/pfdn/model/model_best.pt --test_only --n_threads 0 --n_resblocks 6 --n_feats 52
 
