@@ -1,7 +1,7 @@
 from collections import OrderedDict
 import torch.nn as nn
 import torch.nn.functional as F
-import torch    
+import torch
 from model.lib import BSConvU
 
 
@@ -19,7 +19,7 @@ def conv_layer(in_channels,
     Re-write convolution layer for adaptive `padding`.
     """
     kernel_size = _make_pair(kernel_size)
-    padding = (int((kernel_size[0] - 1) / 2), 
+    padding = (int((kernel_size[0] - 1) / 2),
                int((kernel_size[1] - 1) / 2))
     return nn.Conv2d(in_channels,
                      out_channels,
@@ -65,7 +65,7 @@ def sequential(*args):
     """
     Modules will be added to the a Sequential Container in the order they
     are passed.
-    
+
     Parameters
     ----------
     args: Definition of Modules in order.
@@ -100,11 +100,12 @@ def pixelshuffle_block(in_channels,
     pixel_shuffle = nn.PixelShuffle(upscale_factor)
     return sequential(conv, pixel_shuffle)
 
+
 class LCA(nn.Module):
     """Lightweight Channel Attention: GAP + 1x1 Conv + Sigmoid"""
     def __init__(self, channels, reduction=32):
         super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)  # GAP
+        self.pool = nn.AdaptiveAvgPool2d(1)
         self.conv = nn.Sequential(
             nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=True),
             nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=True),
@@ -115,10 +116,11 @@ class LCA(nn.Module):
         y = self.pool(x)
         y = self.conv(y)
         return x + x * y
-    
+
+
 class ESA(nn.Module):
     """
-    Modification of Enhanced Spatial Attention (ESA), which is proposed by 
+    Modification of Enhanced Spatial Attention (ESA), which is proposed by
     `Residual Feature Aggregation Network for Image Super-Resolution`
     Note: `conv_max` and `conv3_` are NOT used here, so the corresponding codes
     are deleted.
@@ -148,13 +150,28 @@ class ESA(nn.Module):
         return x * m
 
 
+class AFEM(nn.Module):
+    """Adaptive Feature Enhancement Module with residual gating."""
+
+    def __init__(self, channels):
+        super(AFEM, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.act = nn.SiLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        weight = self.sigmoid(self.conv2(self.act(self.conv1(x))))
+        return x + x * weight
+
+
 class PFDB(nn.Module):
 
     def __init__(self,
                  in_channels,
                  mid_channels=None,
                  out_channels=None,
-                 act = 'silu',
+                 act='silu',
                  esa_channels=16,
                  lca_reduction=32):
         super(PFDB, self).__init__()
@@ -170,11 +187,10 @@ class PFDB(nn.Module):
         self.c2_r_front = conv_layer(half_channels, half_channels, 3)
         self.c2_r_back = BSConvU(mid_channels - half_channels, mid_channels - half_channels, kernel_size=3)
         self.mix_conv = nn.Conv2d(mid_channels, mid_channels, kernel_size=1)
-        
+
         self.c3_r = conv_layer(mid_channels, in_channels, 3)
 
         self.c5 = conv_layer(in_channels, out_channels, 1)
-        self.lca = LCA(mid_channels, reduction=lca_reduction)
         self.esa = ESA(esa_channels, out_channels, nn.Conv2d)
         self.act = activation(act)
 
@@ -190,7 +206,7 @@ class PFDB(nn.Module):
         back = self.c2_r_back(back)
         out_before_mix = torch.cat([front, back], dim=1)
 
-        out = self.mix_conv(out_before_mix) + out_before_mix   # 通道交互融合，加入局部短残差
+        out = self.mix_conv(out_before_mix) + out_before_mix
         out = self.act(out)
 
         out = self.c3_r(out)
@@ -200,7 +216,6 @@ class PFDB(nn.Module):
         out = self.esa(self.c5(out))
 
         return out
-
 
 
 class PFDN(nn.Module):
@@ -214,59 +229,53 @@ class PFDN(nn.Module):
                  num_blocks=6):
         super(PFDN, self).__init__()
 
-        num_blocks = args.n_resblocks 
+        num_blocks = args.n_resblocks
         feature_channels = args.n_feats
         upscale = args.scale[0]
         in_channels = args.n_colors
         out_channels = args.n_colors
         kernel_size = 3
         act = args.act
-        
+
         self.conv_1 = conv_layer(in_channels,
-                                       feature_channels,
-                                       kernel_size=kernel_size)
+                                 feature_channels,
+                                 kernel_size=kernel_size)
 
         self.blocks = nn.ModuleList([PFDB(feature_channels, act=act) for _ in range(num_blocks)])
 
         self.conv_2 = conv_layer(feature_channels,
-                                       feature_channels,
-                                       kernel_size=3)
+                                 feature_channels,
+                                 kernel_size=3)
 
         self.fusion_conv = nn.Conv2d(feature_channels * 3, feature_channels, kernel_size=1)
 
-        self.reweight = nn.Conv2d(feature_channels, feature_channels, kernel_size=1, bias=True)
-        
+        self.afem = AFEM(feature_channels)
 
         self.upsampler = pixelshuffle_block(feature_channels,
-                                                  out_channels,
-                                                  upscale_factor=upscale)
+                                            out_channels,
+                                            upscale_factor=upscale)
 
     def forward(self, x):
-        # Step 1. Shallow feature extraction
         shallow = self.conv_1(x)
 
-        # Step 2. Deep feature extraction
         first_block_out = None
         out = shallow
         for i, block in enumerate(self.blocks):
             out = block(out)
             if i == 0:
                 first_block_out = out
-        last_block_out = out  # final deep feature
+        last_block_out = out
 
-        # Step 3. Feature fusion
         fused_input = torch.cat([shallow, first_block_out, last_block_out], dim=1)
         fused = self.fusion_conv(fused_input)
 
-        # Step 4. Residual reweighting
-        fused = fused + fused * torch.sigmoid(self.reweight(fused))
+        fused = self.afem(fused)
 
-        # Step 5. Reconstruction and Upsampling
         fused = self.conv_2(fused) + shallow
         output = self.upsampler(fused)
 
         return output
-    
+
     def load_state_dict(self, state_dict, strict=True):
         own_state = self.state_dict()
         for name, param in state_dict.items():
@@ -285,12 +294,41 @@ class PFDN(nn.Module):
                 if name.find('tail') == -1:
                     raise KeyError('unexpected key "{}" in state_dict'
                                    .format(name))
-    
+
 
 def make_model(args, parent=False):
-    model =  PFDN(args)
-    
+    model = PFDN(args)
+
     params = sum(p.numel() for p in model.parameters())
     print(f"Params: {params/1e3:.1f}K")
 
     return model
+
+
+if __name__ == "__main__":
+    import torch
+
+    device = (
+        'cuda' if torch.cuda.is_available() else
+        'mps' if torch.backends.mps.is_available() else
+        'cpu'
+    )
+    print(f"Running on: {device}")
+
+    class Args:
+        n_resblocks = 6
+        n_feats = 52
+        scale = [2]
+        n_colors = 3
+        act = 'silu'
+
+    args = Args()
+    model = PFDN(args).to(device)
+    model.eval()
+
+    try:
+        from fvcore.nn import FlopCountAnalysis, flop_count_table
+        inputs = torch.rand(1, 3, 640, 360).to(device)
+        print(flop_count_table(FlopCountAnalysis(model, inputs=(inputs,))))
+    except ImportError:
+        print("fvcore not installed; skipping FLOPs analysis.")

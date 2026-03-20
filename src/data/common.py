@@ -5,7 +5,8 @@ import skimage.color as sc
 
 import torch
 
-def get_patch(*args, patch_size=96, scale=2, multi=False, input_large=False):
+# 训练配置文件中的 patch_size 实际指 HR 尺寸（tp）
+def get_patch(*args, patch_size=128, scale=2, multi=False, input_large=False):
     ih, iw = args[0].shape[:2]
 
     if not input_large:
