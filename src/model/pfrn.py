@@ -103,8 +103,8 @@ class ESA(nn.Module):
         return x * mask
 
 
-class DDFB(nn.Module):
-    """Distilled dual-path feature block."""
+class IFDB(nn.Module):
+    """Interactive feature distillation block."""
 
     def __init__(self, channels, act='silu'):
         super().__init__()
@@ -137,28 +137,12 @@ class DDFB(nn.Module):
         aux = self.reduce(x)
         aux = self.aux_dwconv(self.aux_bsconv(aux))
         aux = self.expand(aux)
-        out = torch.cat([main, aux], dim=1)
+        interaction = main * torch.sigmoid(aux)
+        out = torch.cat([interaction, aux], dim=1)
         out = self.concat_fuse(out)
         out = self.act(out)
         out = self.refine(out)
         return x + out
-
-
-class PCRM(nn.Module):
-    """Pixel-wise channel recalibration module."""
-
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-        self.dwconv = depthwise_conv(channels, 3)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        mask = self.conv1(x)
-        mask = self.dwconv(mask)
-        mask = self.sigmoid(self.conv2(mask))
-        return x * mask
 
 
 class PFRB(nn.Module):
@@ -168,21 +152,14 @@ class PFRB(nn.Module):
         super().__init__()
         self.pre = conv_layer(channels, channels, 3)
         self.pre_act = activation(act)
-        self.ddfb = DDFB(channels, act=act)
-        self.post = conv_layer(channels, channels, 3)
-        self.post_act = activation(act)
-        self.fuse = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-        self.pcrm = PCRM(channels)
+        self.ifdb = IFDB(channels, act=act)
         self.esa = ESA(channels, esa_channels=esa_channels)
 
     def forward(self, x):
         identity = x
         feat = self.pre_act(self.pre(x))
-        feat = self.ddfb(feat)
-        feat = self.post_act(self.post(feat))
+        feat = self.ifdb(feat)
         feat = feat + identity
-        feat = self.fuse(feat)
-        feat = self.pcrm(feat)
         return self.esa(feat)
 
 
@@ -223,32 +200,19 @@ class PFRN(nn.Module):
         )
 
     def forward(self, x):
-        shallow = self.shallow_conv(x)
-        f0 = shallow
-
-        deep = shallow
+        f0 = self.shallow_conv(x)
+        feat = f0
         block_outputs = []
         for block in self.blocks:
-            deep = block(deep)
-            block_outputs.append(deep)
+            feat = block(feat)
+            block_outputs.append(feat)
 
-        if not block_outputs:
-            block_outputs = [f0, f0, f0, f0]
-        elif len(block_outputs) == 1:
-            block_outputs = [block_outputs[0]] * 4
-        elif len(block_outputs) == 2:
-            block_outputs = [block_outputs[0], block_outputs[1], block_outputs[0], block_outputs[1]]
-        elif len(block_outputs) == 3:
-            block_outputs = [block_outputs[0], block_outputs[1], block_outputs[1], block_outputs[2]]
-        else:
-            block_outputs = [
-                block_outputs[0],
-                block_outputs[1],
-                block_outputs[-2],
-                block_outputs[-1],
-            ]
-
-        fused = self.fusion_conv1(torch.cat(block_outputs, dim=1))
+        fused = self.fusion_conv1(torch.cat([
+            block_outputs[0],
+            block_outputs[1],
+            block_outputs[-2],
+            block_outputs[-1],
+        ], dim=1))
         fused = self.fusion_conv3(fused)
         lr_feat = self.reconstruction(fused + f0)
         return self.upsampler(lr_feat)
