@@ -125,7 +125,8 @@ class IFDB(nn.Module):
             kernel_size=3,
             padding=1,
         )
-        self.aux_dwconv = depthwise_conv(distilled_channels, 5)
+        self.aux_dwconv3 = depthwise_conv(distilled_channels, 3)
+        self.aux_dwconv5 = depthwise_conv(distilled_channels, 5)
         self.expand = nn.Conv2d(distilled_channels, channels, kernel_size=1, bias=True)
 
         self.concat_fuse = nn.Conv2d(channels * 2, channels, kernel_size=1, bias=True)
@@ -135,7 +136,8 @@ class IFDB(nn.Module):
     def forward(self, x):
         main = self.main_act(self.main_bsconv(x))
         aux = self.reduce(x)
-        aux = self.aux_dwconv(self.aux_bsconv(aux))
+        aux = self.aux_bsconv(aux)
+        aux = self.aux_dwconv3(aux) + self.aux_dwconv5(aux)
         aux = self.expand(aux)
         interaction = main * torch.sigmoid(aux)
         out = torch.cat([interaction, aux], dim=1)
