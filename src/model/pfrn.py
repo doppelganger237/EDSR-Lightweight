@@ -170,20 +170,20 @@ class PFRB(nn.Module):
         super().__init__()
         self.pre = conv_layer(channels, channels, 3)
         self.pre_act = activation(act)
-
-        self.local_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-        self.local_dw = depthwise_conv(channels, 3)
         self.dlfb = DLFB(channels, act=act)
-        self.cfrm = CFRM(channels, act=act)
+        self.post = conv_layer(channels, channels, 3)
+        self.post_act = activation(act)
+        self.fuse = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
         self.esa = ESA(channels, esa_channels=esa_channels)
 
     def forward(self, x):
+        identity = x
         feat = self.pre_act(self.pre(x))
-        local_feat = self.local_dw(self.local_proj(feat))
-        dlfb_feat = self.dlfb(feat)
-        out = self.cfrm(local_feat, dlfb_feat)
-        out = self.esa(out)
-        return x + out
+        feat = self.dlfb(feat)
+        feat = self.post_act(self.post(feat))
+        feat = feat + identity
+        feat = self.fuse(feat)
+        return self.esa(feat)
 
 
 class PFRN(nn.Module):
