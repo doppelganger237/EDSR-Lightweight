@@ -80,8 +80,8 @@ def pixelshuffle_block(in_channels, out_channels, upscale_factor=2, kernel_size=
     return sequential(conv, pixel_shuffle)
 
 
-class ESAB(nn.Module):
-    """Enhanced spatial attention block."""
+class ESA(nn.Module):
+    """Enhanced spatial attention used inside each PFRB."""
 
     def __init__(self, channels, esa_channels=16):
         super().__init__()
@@ -103,61 +103,64 @@ class ESAB(nn.Module):
         return x * mask
 
 
-class AFRM(nn.Module):
-    """Adaptive fusion refinement module following the new dual-input design."""
-
-    def __init__(self, channels):
-        super().__init__()
-        self.shallow_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.deep_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.gate_conv = nn.Conv2d(channels * 2, channels, kernel_size=1)
-        self.sigmoid = nn.Sigmoid()
-        self.refine1 = nn.Conv2d(channels, channels, kernel_size=1)
-        self.act = nn.SiLU(inplace=True)
-        self.refine2 = nn.Conv2d(channels, channels, kernel_size=1)
-
-    def forward(self, shallow, deep):
-        shallow_feat = self.shallow_proj(shallow)
-        deep_feat = self.deep_proj(deep)
-        gate = self.sigmoid(self.gate_conv(torch.cat([shallow_feat, deep_feat], dim=1)))
-        fused = shallow_feat + deep_feat * gate
-        refined = self.refine2(self.act(self.refine1(fused)))
-        return fused + refined
-
-
 class DLFB(nn.Module):
-    """Dual-path local feature block."""
+    """Dual local feature block from the design figure."""
 
-    def __init__(self, channels):
+    def __init__(self, channels, act='silu'):
         super().__init__()
         left_channels = channels // 2
         right_channels = channels - left_channels
         self.left_channels = left_channels
         self.right_channels = right_channels
 
-        self.left_branch = conv_layer(left_channels, left_channels, 3)
+        self.left_conv = conv_layer(left_channels, left_channels, 3)
         self.right_bsconv = BSConvU(
             right_channels,
             right_channels,
             kernel_size=3,
             padding=1,
         )
-        self.right_dw = depthwise_conv(right_channels, 5)
-        self.right_align = None
-        if right_channels != left_channels:
-            self.right_align = nn.Conv2d(right_channels, left_channels, kernel_size=1, bias=True)
-
-        self.fuse = nn.Conv2d(left_channels, channels, kernel_size=1, bias=True)
-        self.act = nn.SiLU(inplace=True)
+        self.right_dwconv = depthwise_conv(right_channels, 5)
+        self.concat_fuse = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.refine = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.act = activation(act)
 
     def forward(self, x):
         left, right = torch.split(x, [self.left_channels, self.right_channels], dim=1)
-        left_feat = self.left_branch(left)
-        right_feat = self.right_dw(self.right_bsconv(right))
-        if self.right_align is not None:
-            right_feat = self.right_align(right_feat)
-        merged = left_feat + right_feat
-        return x + self.act(self.fuse(merged))
+        left = self.left_conv(left)
+        right = self.right_dwconv(self.right_bsconv(right))
+        out = torch.cat([left, right], dim=1)
+        out = self.concat_fuse(out)
+        out = self.act(out)
+        out = self.refine(out)
+        return x + out
+
+
+class CFRM(nn.Module):
+    """
+    Cross-feature refinement module.
+
+    The diagram shows a residual path over the concatenated tensor. We keep that
+    behavior while projecting the residual back to the feature width so the block
+    output matches the rest of the network.
+    """
+
+    def __init__(self, channels, act='silu'):
+        super().__init__()
+        merged_channels = channels * 2
+        self.reduce = nn.Conv2d(merged_channels, channels, kernel_size=1, bias=True)
+        self.act = activation(act)
+        self.conv3 = conv_layer(channels, channels, 3)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.skip = nn.Conv2d(merged_channels, channels, kernel_size=1, bias=True)
+
+    def forward(self, x1, x2):
+        merged = torch.cat([x1, x2], dim=1)
+        out = self.reduce(merged)
+        out = self.act(out)
+        out = self.conv3(out)
+        out = self.conv1(out)
+        return out + self.skip(merged)
 
 
 class PFRB(nn.Module):
@@ -165,27 +168,26 @@ class PFRB(nn.Module):
 
     def __init__(self, channels, act='silu', esa_channels=16):
         super().__init__()
-        self.branch1_pw1 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-        self.branch1_dw = depthwise_conv(channels, 3)
-        self.branch1_pw2 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.pre = conv_layer(channels, channels, 3)
+        self.pre_act = activation(act)
 
-        self.branch2_conv = conv_layer(channels, channels, 3)
-        self.branch2_act = activation(act)
-        self.dlfb = DLFB(channels)
-
-        self.fuse = conv_layer(channels, channels, 3)
-        self.esab = ESAB(channels, esa_channels=esa_channels)
+        self.local_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.local_dw = depthwise_conv(channels, 3)
+        self.dlfb = DLFB(channels, act=act)
+        self.cfrm = CFRM(channels, act=act)
+        self.esa = ESA(channels, esa_channels=esa_channels)
 
     def forward(self, x):
-        branch1 = self.branch1_pw2(self.branch1_dw(self.branch1_pw1(x)))
-        branch2 = self.dlfb(self.branch2_act(self.branch2_conv(x)))
-        out = self.fuse(branch1 + branch2)
-        out = self.esab(out)
+        feat = self.pre_act(self.pre(x))
+        local_feat = self.local_dw(self.local_proj(feat))
+        dlfb_feat = self.dlfb(feat)
+        out = self.cfrm(local_feat, dlfb_feat)
+        out = self.esa(out)
         return x + out
 
 
 class PFRN(nn.Module):
-    """Progressive feature refinement network."""
+    """PFRN redesigned to follow the provided shallow/deep/reconstruction layout."""
 
     def __init__(
         self,
@@ -211,9 +213,9 @@ class PFRN(nn.Module):
             [PFRB(feature_channels, act=act, esa_channels=esa_channels) for _ in range(num_blocks)]
         )
 
-        self.fusion_conv = nn.Conv2d(feature_channels * 3, feature_channels, kernel_size=1, bias=True)
-        self.afrm = AFRM(feature_channels)
-
+        self.deep_conv = conv_layer(feature_channels, feature_channels, 3)
+        self.fusion_conv1 = nn.Conv2d(feature_channels * 3, feature_channels, kernel_size=1, bias=True)
+        self.fusion_conv3 = conv_layer(feature_channels, feature_channels, 3)
         self.reconstruction = conv_layer(feature_channels, feature_channels, 3)
         self.upsampler = pixelshuffle_block(
             feature_channels,
@@ -226,17 +228,21 @@ class PFRN(nn.Module):
         f0 = shallow
 
         deep = shallow
-        f1 = shallow
+        f1 = None
         for idx, block in enumerate(self.blocks):
             deep = block(deep)
             if idx == 0:
                 f1 = deep
-        fn = deep
 
-        fused = self.fusion_conv(torch.cat([f0, f1, fn], dim=1))
-        refined = self.afrm(f0, fused)
-        final_feat = refined + fused
-        lr_feat = self.reconstruction(final_feat)
+        if f1 is None:
+            f1 = deep
+
+        f6 = deep
+        f7 = self.deep_conv(f6)
+
+        fused = self.fusion_conv1(torch.cat([f1, f6, f7], dim=1))
+        fused = self.fusion_conv3(fused)
+        lr_feat = self.reconstruction(fused + f0)
         return self.upsampler(lr_feat)
 
     def load_state_dict(self, state_dict, strict=True):

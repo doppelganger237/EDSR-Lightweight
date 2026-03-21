@@ -1,6 +1,6 @@
 # 训练部分
 
-python main.py --model PFRN --scale 2 --patch_size 128 --n_resblocks 8 --n_feats 52 --save pfrn --n_threads 0 --lr 5e-4 --batch_size 16 --epochs 1000 --decay 200-400-600-800
+python main.py --model PFRN --scale 2 --patch_size 128 --n_resblocks 6 --n_feats 52 --save pfrn --n_threads 0 --lr 5e-4 --batch_size 16 --epochs 1000 --decay 200-400-600-800
 
 # python main.py --model PFRN --scale 2 --patch_size 128 --n_resblocks 6 --n_feats 52 --save pfrn --load pfrn --n_threads 0 --lr 5e-4 --batch_size 16 --resume -1 --epochs 1000 --decay 200-400-600-800
 
