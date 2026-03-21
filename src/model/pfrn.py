@@ -80,8 +80,8 @@ def pixelshuffle_block(in_channels, out_channels, upscale_factor=2, kernel_size=
     return sequential(conv, pixel_shuffle)
 
 
-class ESA(nn.Module):
-    """Enhanced spatial attention used inside each PFRB."""
+class ESAB(nn.Module):
+    """Enhanced spatial attention block used inside each PFRB."""
 
     def __init__(self, channels, esa_channels=16):
         super().__init__()
@@ -103,47 +103,62 @@ class ESA(nn.Module):
         return x * mask
 
 
+ESA = ESAB
+
+
+class MAGB(nn.Module):
+    """Multi-scale aggregation branch."""
+
+    def __init__(self, channels, act='silu'):
+        super().__init__()
+        hidden_channels = max(1, int(channels * 0.75))
+
+        self.reduce = nn.Conv2d(channels, hidden_channels, kernel_size=1, bias=True)
+        self.bsconv = BSConvU(
+            hidden_channels,
+            hidden_channels,
+            kernel_size=3,
+            padding=1,
+        )
+        self.act = activation(act)
+        self.dwconv3 = depthwise_conv(hidden_channels, 3)
+        self.dwconv5 = depthwise_conv(hidden_channels, 5)
+        self.fuse = nn.Conv2d(hidden_channels * 2, hidden_channels, kernel_size=1, bias=True)
+        self.expand = nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=True)
+
+    def forward(self, x):
+        feat = self.reduce(x)
+        feat = self.bsconv(feat)
+        feat = self.act(feat)
+        multi_scale = torch.cat([self.dwconv3(feat), self.dwconv5(feat)], dim=1)
+        multi_scale = self.fuse(multi_scale)
+        return self.expand(multi_scale)
+
+
 class IFDB(nn.Module):
     """Interactive feature distillation block."""
 
     def __init__(self, channels, act='silu'):
         super().__init__()
-        distilled_channels = channels // 2
-
-        self.main_bsconv = BSConvU(
+        self.local_branch = BSConvU(
             channels,
             channels,
             kernel_size=3,
             padding=1,
         )
-        self.main_act = activation(act)
-
-        self.reduce = nn.Conv2d(channels, distilled_channels, kernel_size=1, bias=True)
-        self.aux_bsconv = BSConvU(
-            distilled_channels,
-            distilled_channels,
-            kernel_size=3,
-            padding=1,
-        )
-        self.aux_dwconv3 = depthwise_conv(distilled_channels, 3)
-        self.aux_dwconv5 = depthwise_conv(distilled_channels, 5)
-        self.expand = nn.Conv2d(distilled_channels, channels, kernel_size=1, bias=True)
-
-        self.concat_fuse = nn.Conv2d(channels * 2, channels, kernel_size=1, bias=True)
-        self.act = activation(act)
-        self.refine = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.local_act = activation(act)
+        self.context_branch = MAGB(channels, act=act)
+        self.gate = nn.Conv2d(channels * 2, channels, kernel_size=1, bias=True)
+        self.refine1 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.refine_act = activation(act)
+        self.refine2 = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
 
     def forward(self, x):
-        main = self.main_act(self.main_bsconv(x))
-        aux = self.reduce(x)
-        aux = self.aux_bsconv(aux)
-        aux = self.aux_dwconv3(aux) + self.aux_dwconv5(aux)
-        aux = self.expand(aux)
-        interaction = main * torch.sigmoid(aux)
-        out = torch.cat([interaction, aux], dim=1)
-        out = self.concat_fuse(out)
-        out = self.act(out)
-        out = self.refine(out)
+        local_feat = self.local_act(self.local_branch(x))
+        context_feat = self.context_branch(x)
+        gate = torch.sigmoid(self.gate(torch.cat([local_feat, context_feat], dim=1)))
+        fused = local_feat + gate * context_feat
+        out = self.refine2(self.refine_act(self.refine1(fused)))
         return x + out
 
 
@@ -155,7 +170,7 @@ class PFRB(nn.Module):
         self.pre = conv_layer(channels, channels, 3)
         self.pre_act = activation(act)
         self.ifdb = IFDB(channels, act=act)
-        self.esa = ESA(channels, esa_channels=esa_channels)
+        self.esa = ESAB(channels, esa_channels=esa_channels)
 
     def forward(self, x):
         identity = x
