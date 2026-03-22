@@ -109,7 +109,7 @@ ESA = ESAB
 class MAGB(nn.Module):
     """Multi-scale aggregation branch."""
 
-    def __init__(self, channels, act='silu'):
+    def __init__(self, channels, act='lrelu'):
         super().__init__()
         hidden_channels = max(1, int(channels * 0.75))
 
@@ -123,22 +123,20 @@ class MAGB(nn.Module):
         self.act = activation(act)
         self.dwconv3 = depthwise_conv(hidden_channels, 3)
         self.dwconv5 = depthwise_conv(hidden_channels, 5)
-        self.fuse = nn.Conv2d(hidden_channels * 2, hidden_channels, kernel_size=1, bias=True)
-        self.expand = nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=True)
+        self.project = nn.Conv2d(hidden_channels * 2, channels, kernel_size=1, bias=True)
 
     def forward(self, x):
         feat = self.reduce(x)
         feat = self.bsconv(feat)
         feat = self.act(feat)
         multi_scale = torch.cat([self.dwconv3(feat), self.dwconv5(feat)], dim=1)
-        multi_scale = self.fuse(multi_scale)
-        return self.expand(multi_scale)
+        return self.project(multi_scale)
 
 
 class IFDB(nn.Module):
     """Interactive feature distillation block."""
 
-    def __init__(self, channels, act='silu'):
+    def __init__(self, channels, act='lrelu'):
         super().__init__()
         self.local_branch = BSConvU(
             channels,
@@ -146,6 +144,8 @@ class IFDB(nn.Module):
             kernel_size=3,
             padding=1,
         )
+
+        
         self.local_act = activation(act)
         self.context_branch = MAGB(channels, act=act)
         self.gate = nn.Conv2d(channels * 2, channels, kernel_size=1, bias=True)
@@ -165,7 +165,7 @@ class IFDB(nn.Module):
 class PFRB(nn.Module):
     """Progressive feature refinement block."""
 
-    def __init__(self, channels, act='silu', esa_channels=16):
+    def __init__(self, channels, act='lrelu', esa_channels=16):
         super().__init__()
         self.pre = conv_layer(channels, channels, 3)
         self.pre_act = activation(act)
@@ -207,7 +207,8 @@ class PFRN(nn.Module):
             [PFRB(feature_channels, act=act, esa_channels=esa_channels) for _ in range(num_blocks)]
         )
 
-        self.fusion_conv1 = nn.Conv2d(feature_channels * 4, feature_channels, kernel_size=1, bias=True)
+        self.fusion_conv1 = nn.Conv2d(feature_channels * num_blocks, feature_channels, kernel_size=1, bias=True)
+        self.fusion_act = activation(act)
         self.fusion_conv3 = conv_layer(feature_channels, feature_channels, 3)
         self.reconstruction = conv_layer(feature_channels, feature_channels, 3)
         self.upsampler = pixelshuffle_block(
@@ -224,12 +225,8 @@ class PFRN(nn.Module):
             feat = block(feat)
             block_outputs.append(feat)
 
-        fused = self.fusion_conv1(torch.cat([
-            block_outputs[0],
-            block_outputs[1],
-            block_outputs[-2],
-            block_outputs[-1],
-        ], dim=1))
+        fused = self.fusion_conv1(torch.cat(block_outputs, dim=1))
+        fused = self.fusion_act(fused)
         fused = self.fusion_conv3(fused)
         lr_feat = self.reconstruction(fused + f0)
         return self.upsampler(lr_feat)
@@ -276,7 +273,7 @@ if __name__ == "__main__":
         n_feats = 52
         scale = [2]
         n_colors = 3
-        act = 'silu'
+        act = 'lrelu'
 
     args = Args()
     model = PFRN(args).to(device)
