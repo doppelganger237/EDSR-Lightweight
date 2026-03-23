@@ -268,86 +268,79 @@ class SRBEU(nn.Module):
 # =========================================================
 # DP: Multi-scale Differential Rectification Module
 # =========================================================
-class MDRM(nn.Module):
+class CIRM(nn.Module):
     """
-    Fa, Fb
-    -> Concat -> Shuffle -> Conv1
-    -> DW3 / DW5 / Pool-Conv-Up
-    -> Concat -> Conv1 -> Sigmoid
-    -> rectification
+    Cross-stage Interactive Rectification Module
+    Two-input rectification with local and contextual interaction.
     """
     def __init__(self, channels, shuffle_groups=4):
         super().__init__()
         self.shuffle = ChannelShuffle(groups=shuffle_groups)
 
-        self.reduce = nn.Conv2d(channels * 2, channels, 1, bias=True)
-
+        self.align = nn.Conv2d(channels * 2, channels, 1, bias=True)
         self.dw3 = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=True)
-        self.dw5 = nn.Conv2d(channels, channels, 5, padding=2, groups=channels, bias=True)
-
         self.pool_conv = nn.Conv2d(channels, channels, 1, bias=True)
 
-        self.mask_fuse = nn.Conv2d(channels * 3, channels, 1, bias=True)
-        self.out_fuse = nn.Conv2d(channels * 2, channels, 1, bias=True)
+        self.fuse = nn.Conv2d(channels * 2, channels, 1, bias=True)
+        self.out = nn.Conv2d(channels, channels, 1, bias=True)
 
         self.act = nn.GELU()
 
     def forward(self, fa, fb):
         x = torch.cat([fa, fb], dim=1)
         x = self.shuffle(x)
-        base = self.act(self.reduce(x))
+        base = self.act(self.align(x))
 
-        b1 = self.act(self.dw3(base))
-        b2 = self.act(self.dw5(base))
+        local = self.act(self.dw3(base))
 
-        b3 = F.max_pool2d(base, kernel_size=2, stride=2)
-        b3 = self.act(self.pool_conv(b3))
-        b3 = F.interpolate(b3, size=base.shape[-2:], mode='bilinear', align_corners=False)
+        context = F.max_pool2d(base, kernel_size=2, stride=2)
+        context = self.act(self.pool_conv(context))
+        context = F.interpolate(context, size=base.shape[-2:], mode='bilinear', align_corners=False)
 
-        mask = torch.sigmoid(self.mask_fuse(torch.cat([b1, b2, b3], dim=1)))
-        out = self.out_fuse(torch.cat([base, base * mask], dim=1))
+        refine = self.act(self.fuse(torch.cat([local, context], dim=1)))
+        out = self.out(base + refine)
         return out
 
 
 # =========================================================
 # BF: Hierarchical Distillation Fusion Refinement Module
 # =========================================================
-class HDFRM(nn.Module):
+class THFM(nn.Module):
     """
-    P12, D2, P34, T
-    -> Concat -> Shuffle -> Conv1
-    -> DW3 / DW5 / Pool-Conv-Up
-    -> Concat -> Conv1 -> GELU -> Conv1
+    Tree-structured Hierarchical Fusion Module
+    Group-wise fusion first, then global fusion.
     """
-    def __init__(self, stage_channels, out_channels, shuffle_groups=4):
+    def __init__(self, stage_channels, out_channels):
         super().__init__()
-        self.shuffle = ChannelShuffle(groups=shuffle_groups)
 
-        self.reduce = nn.Conv2d(stage_channels * 4, out_channels, 1, bias=True)
+        self.fuse12_reduce = nn.Conv2d(stage_channels * 2, out_channels, 1, bias=True)
+        self.fuse34_reduce = nn.Conv2d(stage_channels * 2, out_channels, 1, bias=True)
 
-        self.dw3 = nn.Conv2d(out_channels, out_channels, 3, padding=1, groups=out_channels, bias=True)
-        self.dw5 = nn.Conv2d(out_channels, out_channels, 5, padding=2, groups=out_channels, bias=True)
-        self.pool_conv = nn.Conv2d(out_channels, out_channels, 1, bias=True)
+        self.fuse12_dw = nn.Conv2d(out_channels, out_channels, 3, padding=1, groups=out_channels, bias=True)
+        self.fuse34_dw = nn.Conv2d(out_channels, out_channels, 3, padding=1, groups=out_channels, bias=True)
 
-        self.fuse1 = nn.Conv2d(out_channels * 3, out_channels, 1, bias=True)
-        self.fuse2 = nn.Conv2d(out_channels, out_channels, 1, bias=True)
+        self.group_out1 = nn.Conv2d(out_channels, out_channels, 1, bias=True)
+        self.group_out2 = nn.Conv2d(out_channels, out_channels, 1, bias=True)
+
+        self.global_shuffle = ChannelShuffle(groups=4)
+        self.global_reduce = nn.Conv2d(out_channels * 2, out_channels, 1, bias=True)
+        self.global_b2 = B2Conv(out_channels, out_channels, kernel_size=3, padding=1)
+        self.global_out = nn.Conv2d(out_channels, out_channels, 1, bias=True)
 
         self.act = nn.GELU()
 
     def forward(self, p12, d2, p34, t):
-        x = torch.cat([p12, d2, p34, t], dim=1)
-        x = self.shuffle(x)
-        x = self.act(self.reduce(x))
+        g1 = self.act(self.fuse12_reduce(torch.cat([p12, d2], dim=1)))
+        g1 = self.group_out1(self.act(self.fuse12_dw(g1)))
 
-        b1 = self.act(self.dw3(x))
-        b2 = self.act(self.dw5(x))
+        g2 = self.act(self.fuse34_reduce(torch.cat([p34, t], dim=1)))
+        g2 = self.group_out2(self.act(self.fuse34_dw(g2)))
 
-        b3 = F.max_pool2d(x, kernel_size=2, stride=2)
-        b3 = self.act(self.pool_conv(b3))
-        b3 = F.interpolate(b3, size=x.shape[-2:], mode='bilinear', align_corners=False)
-
-        x = self.act(self.fuse1(torch.cat([b1, b2, b3], dim=1)))
-        x = self.fuse2(x)
+        x = torch.cat([g1, g2], dim=1)
+        x = self.global_shuffle(x)
+        x = self.act(self.global_reduce(x))
+        x = self.act(self.global_b2(x))
+        x = self.global_out(x)
         return x
 
 
@@ -361,11 +354,9 @@ class SCRM(nn.Module):
     def __init__(self, channels, esa_channels=16):
         super().__init__()
         self.esa = ESA(channels, esa_channels=esa_channels)
-        self.cca = CCALayer(channels)
 
     def forward(self, x):
         x = self.esa(x)
-        x = self.cca(x)
         return x
 
 
@@ -390,11 +381,11 @@ class B2RFDB(nn.Module):
         self.c4 = B2Conv(self.rc, self.dc, kernel_size=3, padding=1)
 
         # DP
-        self.p12 = MDRM(self.dc)
-        self.p34 = MDRM(self.dc)
+        self.p12 = CIRM(self.dc)
+        self.p34 = CIRM(self.dc)
 
         # BF
-        self.hdfrm = HDFRM(stage_channels=self.dc, out_channels=in_channels)
+        self.hdfrm = THFM(stage_channels=self.dc, out_channels=in_channels)
 
         # tail recalibration
         self.scrm = SCRM(in_channels)
