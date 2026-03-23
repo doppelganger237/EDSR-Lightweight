@@ -7,6 +7,7 @@
 python main.py --model PFRN --data_test Set5+Set14+B100+Urban100 --scale 2 --pre_train ../experiment/pfrn_x2/model/model_best.pt --test_only --n_threads 0 --n_resblocks 8 --n_feats 52
 
 
+#python main.py --model PFRN --data_test Set5+Set14+B100+Urban100 --scale 2 --pre_train ../experiment/pfrn_x2/model/model_best.pt --test_only --n_threads 0 --n_resblocks 8 --n_feats 52
 
 
 #python main.py --model PFDN --scale 2 --patch_size 128 --n_resblocks 6 --n_feats 52 --save pfdn --load pfdn --n_threads 0 --lr 5e-4 --batch_size 64 --resume -1 --epochs 1000 --decay 200-400-600-800
