@@ -295,7 +295,6 @@ class MFDB(nn.Module):
         self.c5 = nn.Conv2d(self.dc * 4, in_channels, 1, 1, 0)
         self.c6 = nn.Conv2d(in_channels, in_channels, 1, 1, 0)
         self.lksca = LKSCA(in_channels)
-        self.cca = MCCALayer(in_channels)
 
     def forward(self, input):
         distilled_c1 = self.act(self.c1_d(input))
@@ -316,7 +315,6 @@ class MFDB(nn.Module):
         out = self.c5(out)
         out = self.c6(out)
         out = self.lksca(out)
-        out = self.cca(out)
 
         return out + input
 
