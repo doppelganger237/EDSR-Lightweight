@@ -103,40 +103,71 @@ class MCCALayer(nn.Module):
         return x * y
 
 
-class LKSCA(nn.Module):
-    def __init__(self, channel, reduction=16):
+class LESSA(nn.Module):
+    def __init__(self, channel):
         super().__init__()
-        mid = max(8, channel // reduction)
+        self.pre = nn.Conv2d(channel, channel, 1, 1, 0, bias=True)
+
+        self.dw_local = nn.Conv2d(
+            channel,
+            channel,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=channel,
+            bias=True
+        )
+
         self.dw_h1 = nn.Conv2d(
-            channel, channel, kernel_size=(1, 7), stride=1, padding=(0, 3), groups=channel, bias=True
+            channel,
+            channel,
+            kernel_size=(1, 7),
+            stride=1,
+            padding=(0, 3),
+            groups=channel,
+            bias=True
         )
         self.dw_v1 = nn.Conv2d(
-            channel, channel, kernel_size=(7, 1), stride=1, padding=(3, 0), groups=channel, bias=True
+            channel,
+            channel,
+            kernel_size=(7, 1),
+            stride=1,
+            padding=(3, 0),
+            groups=channel,
+            bias=True
         )
+
         self.dw_h2 = nn.Conv2d(
-            channel, channel, kernel_size=(1, 11), stride=1, padding=(0, 5), groups=channel, bias=True
+            channel,
+            channel,
+            kernel_size=(1, 11),
+            stride=1,
+            padding=(0, 5),
+            groups=channel,
+            bias=True
         )
         self.dw_v2 = nn.Conv2d(
-            channel, channel, kernel_size=(11, 1), stride=1, padding=(5, 0), groups=channel, bias=True
+            channel,
+            channel,
+            kernel_size=(11, 1),
+            stride=1,
+            padding=(5, 0),
+            groups=channel,
+            bias=True
         )
-        self.spatial_proj = nn.Conv2d(channel, channel, kernel_size=1, stride=1, padding=0, bias=True)
-        self.channel_gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channel, mid, kernel_size=1, padding=0, bias=True),
-            nn.GELU(),
-            nn.Conv2d(mid, channel, kernel_size=1, padding=0, bias=True),
-            nn.Sigmoid(),
-        )
-        self.spatial_act = nn.Sigmoid()
+
+        self.proj = nn.Conv2d(channel, channel, 1, 1, 0, bias=True)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        attn = self.dw_h1(x)
+        attn = self.pre(x)
+        attn = self.dw_local(attn)
+        attn = self.dw_h1(attn)
         attn = self.dw_v1(attn)
         attn = self.dw_h2(attn)
         attn = self.dw_v2(attn)
-        attn = self.spatial_act(self.spatial_proj(attn))
-        gate = self.channel_gate(x)
-        return x * attn * gate
+        attn = self.sigmoid(self.proj(attn))
+        return x + x * attn
 
 
 class MCBSConv(nn.Module):
@@ -161,6 +192,15 @@ class MCBSConv(nn.Module):
         c3 = out_channels - c1 - c2
         self.split_channels = (c1, c2, c3)
 
+        self.short = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+            stride=stride,
+            padding=0,
+            bias=False,
+            padding_mode=padding_mode,
+        )
         self.proj = nn.Conv2d(
             in_channels=in_channels,
             out_channels=2 * out_channels,
@@ -170,42 +210,36 @@ class MCBSConv(nn.Module):
             bias=bias,
             padding_mode=padding_mode,
         )
-        self.dw1 = None
-        if c1 > 0:
-            self.dw1 = nn.Conv2d(
-                in_channels=c1,
-                out_channels=c1,
-                kernel_size=1,
-                stride=stride,
-                padding=0,
-                groups=c1,
-                bias=bias,
-                padding_mode=padding_mode,
-            )
-        self.dw3 = None
-        if c2 > 0:
-            self.dw3 = nn.Conv2d(
-                in_channels=c2,
-                out_channels=c2,
-                kernel_size=3,
-                stride=stride,
-                padding=1,
-                groups=c2,
-                bias=bias,
-                padding_mode=padding_mode,
-            )
-        self.dw5 = None
-        if c3 > 0:
-            self.dw5 = nn.Conv2d(
-                in_channels=c3,
-                out_channels=c3,
-                kernel_size=5,
-                stride=stride,
-                padding=2,
-                groups=c3,
-                bias=bias,
-                padding_mode=padding_mode,
-            )
+        self.dw1 = nn.Conv2d(
+            in_channels=c1,
+            out_channels=c1,
+            kernel_size=1,
+            stride=stride,
+            padding=0,
+            groups=c1,
+            bias=bias,
+            padding_mode=padding_mode,
+        )
+        self.dw3 = nn.Conv2d(
+            in_channels=c2,
+            out_channels=c2,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            groups=c2,
+            bias=bias,
+            padding_mode=padding_mode,
+        )
+        self.dw5 = nn.Conv2d(
+            in_channels=c3,
+            out_channels=c3,
+            kernel_size=5,
+            stride=stride,
+            padding=2,
+            groups=c3,
+            bias=bias,
+            padding_mode=padding_mode,
+        )
         self.fuse = nn.Conv2d(
             in_channels=out_channels,
             out_channels=out_channels,
@@ -214,9 +248,10 @@ class MCBSConv(nn.Module):
             padding=0,
             bias=False,
         )
-        self.act = nn.ELU()
+        self.act = nn.GELU()
 
     def forward(self, x):
+        shortcut = self.short(x)
         x_proj = self.proj(x)
         x_gate, x_feat = torch.chunk(x_proj, 2, dim=1)
         x_gate = torch.sigmoid(x_gate)
@@ -224,49 +259,68 @@ class MCBSConv(nn.Module):
         x_mod = x_gate * x_feat
 
         x1, x2, x3 = torch.split(x_mod, self.split_channels, dim=1)
-        y1 = self.dw1(x1) if self.dw1 is not None else x1
-        y2 = self.dw3(x2) if self.dw3 is not None else x2
-        y3 = self.dw5(x3) if self.dw5 is not None else x3
+        y1 = self.dw1(x1)
+        y2 = self.dw3(x2)
+        y3 = self.dw5(x3)
 
         out = torch.cat([y1, y2, y3], dim=1)
         out = self.fuse(out)
-        return out
+        return out + shortcut
 
 
 class PairFuse(nn.Module):
-    def __init__(self, channels, hidden_channels=None, kernel_size=5):
+    def __init__(self, channels, hidden_channels=None):
         super().__init__()
         if hidden_channels is None:
             hidden_channels = channels
-        padding = kernel_size // 2
-        self.pw1 = conv_layer(channels, hidden_channels, 1)
+
+        self.pre = nn.Conv2d(channels, hidden_channels, 1, 1, 0, bias=True)
         self.act1 = nn.GELU()
-        self.dw5 = nn.Conv2d(hidden_channels,
-                             hidden_channels,
-                             kernel_size=kernel_size,
-                             stride=1,
-                             padding=padding,
-                             groups=hidden_channels,
-                             bias=True)
+
+        self.branch3 = nn.Conv2d(
+            hidden_channels,
+            hidden_channels,
+            3,
+            1,
+            1,
+            groups=hidden_channels,
+            bias=True
+        )
+        self.branch5 = nn.Conv2d(
+            hidden_channels,
+            hidden_channels,
+            5,
+            1,
+            2,
+            groups=hidden_channels,
+            bias=True
+        )
+        self.branch1 = nn.Conv2d(
+            hidden_channels,
+            hidden_channels,
+            1,
+            1,
+            0,
+            bias=True
+        )
+
+        self.local_merge = nn.Conv2d(hidden_channels * 2, hidden_channels, 1, 1, 0, bias=True)
         self.act2 = nn.GELU()
-        self.dw3 = nn.Conv2d(hidden_channels,
-                             hidden_channels,
-                             kernel_size=3,
-                             stride=1,
-                             padding=1,
-                             groups=hidden_channels,
-                             bias=True)
-        self.pw2 = conv_layer(hidden_channels, channels, 1)
+        self.final_merge = nn.Conv2d(hidden_channels * 2, channels, 1, 1, 0, bias=True)
 
     def forward(self, x):
         identity = x
-        x = self.pw1(x)
-        x = self.act1(x)
-        x = self.dw5(x)
-        x = self.act2(x)
-        x = self.dw3(x)
-        x = self.pw2(x)
-        return x + identity
+
+        f = self.act1(self.pre(x))
+
+        f3 = self.branch3(f)
+        f5 = self.branch5(f)
+        f1 = self.branch1(f)
+
+        fm = self.act2(self.local_merge(torch.cat([f3, f5], dim=1)))
+        out = self.final_merge(torch.cat([fm, f1], dim=1))
+
+        return identity + out
 
 
 class MFDB(nn.Module):
@@ -290,11 +344,10 @@ class MFDB(nn.Module):
         self.c4 = self.conv(self.rc, self.dc, kernel_size=3, padding=1)
         self.act = nn.GELU()
 
-        self.g12_fuse = PairFuse(self.dc * 2, kernel_size=5)
-        self.g34_fuse = PairFuse(self.dc * 2, kernel_size=5)
+        self.g12_fuse = PairFuse(self.dc * 2)
+        self.g34_fuse = PairFuse(self.dc * 2)
         self.c5 = nn.Conv2d(self.dc * 4, in_channels, 1, 1, 0)
-        self.c6 = nn.Conv2d(in_channels, in_channels, 1, 1, 0)
-        self.lksca = LKSCA(in_channels)
+        self.lessa = LESSA(in_channels)
 
     def forward(self, input):
         distilled_c1 = self.act(self.c1_d(input))
@@ -313,8 +366,7 @@ class MFDB(nn.Module):
 
         out = torch.cat([g12, g34], dim=1)
         out = self.c5(out)
-        out = self.c6(out)
-        out = self.lksca(out)
+        out = self.lessa(out)
 
         return out + input
 

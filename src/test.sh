@@ -14,7 +14,7 @@ python main.py --model SPFDN --data_test Set5+Set14+B100+Urban100 --scale 2 --pr
 
 #python main.py --model SPFDN --data_test Set5+Set14+B100+Urban100 --scale 2 --pre_train ../experiment/spfdn_x2/model/model_best.pt --test_only --n_threads 4 --n_resblocks 8 --n_feats 56
 
-python main.py --model MFDN --scale 2 --patch_size 128 --n_resblocks 8 --n_feats 64 --save mfdn_x2 --n_threads 4 --lr 5e-4 --batch_size 16 --epochs 1000 --decay 200-400-600-800
+python main.py --model MFDN --scale 2 --patch_size 128 --n_resblocks 6 --n_feats 64 --save mfdn_x2 --n_threads 4 --lr 5e-4 --batch_size 16 --epochs 1000 --decay 200-400-600-800
 
 #python main.py --model PFDN --scale 2 --patch_size 128 --n_resblocks 6 --n_feats 52 --save pfdn --load pfdn --n_threads 0 --lr 5e-4 --batch_size 64 --resume -1 --epochs 1000 --decay 200-400-600-800
 

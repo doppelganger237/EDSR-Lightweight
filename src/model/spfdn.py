@@ -171,39 +171,58 @@ class PartialB2ConvU(nn.Module):
 
 
 class PairFuse(nn.Module):
-    def __init__(self, channels, hidden_channels=None, kernel_size=5):
+    def __init__(self, channels, hidden_channels=None):
         super().__init__()
         if hidden_channels is None:
             hidden_channels = channels
-        padding = kernel_size // 2
-        self.pw1 = conv_layer(channels, hidden_channels, 1)
+
+        self.pre = nn.Conv2d(channels, hidden_channels, 1, 1, 0, bias=True)
         self.act1 = nn.GELU()
-        self.dw5 = nn.Conv2d(hidden_channels,
-                             hidden_channels,
-                             kernel_size=kernel_size,
-                             stride=1,
-                             padding=padding,
-                             groups=hidden_channels,
-                             bias=True)
+
+        self.branch3 = nn.Conv2d(
+            hidden_channels,
+            hidden_channels,
+            3,
+            1,
+            1,
+            groups=hidden_channels,
+            bias=True
+        )
+        self.branch5 = nn.Conv2d(
+            hidden_channels,
+            hidden_channels,
+            5,
+            1,
+            2,
+            groups=hidden_channels,
+            bias=True
+        )
+        self.branch1 = nn.Conv2d(
+            hidden_channels,
+            hidden_channels,
+            1,
+            1,
+            0,
+            bias=True
+        )
+
+        self.local_merge = nn.Conv2d(hidden_channels * 2, hidden_channels, 1, 1, 0, bias=True)
         self.act2 = nn.GELU()
-        self.dw3 = nn.Conv2d(hidden_channels,
-                             hidden_channels,
-                             kernel_size=3,
-                             stride=1,
-                             padding=1,
-                             groups=hidden_channels,
-                             bias=True)
-        self.pw2 = conv_layer(hidden_channels, channels, 1)
+        self.final_merge = nn.Conv2d(hidden_channels * 2, channels, 1, 1, 0, bias=True)
 
     def forward(self, x):
         identity = x
-        x = self.pw1(x)
-        x = self.act1(x)
-        x = self.dw5(x)
-        x = self.act2(x)
-        x = self.dw3(x)
-        x = self.pw2(x)
-        return x + identity
+
+        f = self.act1(self.pre(x))
+
+        f3 = self.branch3(f)
+        f5 = self.branch5(f)
+        f1 = self.branch1(f)
+
+        fm = self.act2(self.local_merge(torch.cat([f3, f5], dim=1)))
+        out = self.final_merge(torch.cat([fm, f1], dim=1))
+
+        return identity + out
 
 
 class FPA(nn.Module):
@@ -254,8 +273,8 @@ class PFDB(nn.Module):
         self.c4 = B2Conv(self.rc, self.dc, kernel_size=3, padding=1)
         self.act = nn.GELU()
 
-        self.g12_fuse = PairFuse(self.dc * 2, kernel_size=5)
-        self.g34_fuse = PairFuse(self.dc * 2, kernel_size=5)
+        self.g12_fuse = PairFuse(self.dc * 2)
+        self.g34_fuse = PairFuse(self.dc * 2)
         self.fpa_channels = in_channels
         self.c5 = nn.Conv2d(self.dc * 4, self.fpa_channels, 1, 1, 0)
         self.fpa = FPA(self.fpa_channels)
